@@ -1,0 +1,34 @@
+#!/bin/sh
+# pre-commit (план 231 трек Д): машинные версии стоячих правил.
+# 1) Конфликт-маркеры в staged.
+if git diff --cached | grep -E '^\+(<<<<<<<|>>>>>>>|=======$)' >/dev/null 2>&1; then
+  echo "pre-commit: conflict markers in staged — commit blocked." >&2
+  exit 1
+fi
+# 2) Авторство: не Claude/anthropic (урок 2026-07-25, 349 коммитов).
+AN=$(git config user.name)
+AE=$(git config user.email)
+case "$AN $AE" in
+  *[Cc]laude*|*anthropic*)
+    echo "pre-commit: author '$AN <$AE>' blocked — restore owner git identity." >&2
+    exit 1;;
+esac
+# 4) README пакета — ВСЕГДА пара en+ru (решение владельца 2026-08-03,
+#    doc-conventions #language; страж doc-conventions делает то же самое в nova).
+if [ -f README.md ] && [ ! -f README.ru.md ]; then
+  echo "pre-commit(readme_pair): est README.md, net README.ru.md — para obyazatelna." >&2
+  exit 1
+fi
+if [ -f README.ru.md ] && [ ! -f README.md ]; then
+  echo "pre-commit(readme_pair): est README.ru.md, net README.md — para obyazatelna." >&2
+  exit 1
+fi
+
+# Норма об инвариантах (docs/dev/conventions-governance.md в репе nova) —
+# ВСЕОБЪЕМЛЮЩАЯ по требованию владельца 2026-08-08: действует и в пакетных
+# репах. Страж роздан scripts/tools/sync-guards-to-packages.sh, расхождение
+# копий ловит гейт nova.
+ROOT="$(git rev-parse --show-toplevel)"
+if [ -f "$ROOT/scripts/guards/check-invariant-discipline.sh" ]; then
+    bash "$ROOT/scripts/guards/check-invariant-discipline.sh" "$ROOT" HEAD || exit 1
+fi

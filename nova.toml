@@ -1,0 +1,20 @@
+# nova.toml — nova-postgres: the PostgreSQL wire protocol for Nova, as pure functions.
+#
+# Layout: src/ canon (Plan 195, "package layout"); the source root is set via the
+# `[lib] src` key, so module paths resolve relative to `src/` (D78 — the module
+# path does NOT include `src`).
+#
+# Sans-I/O by design (nova plan 286, slice D8a): the package turns bytes into
+# protocol messages and messages into bytes, and runs authentication as pure
+# state steps. It never opens a socket; the consumer pumps the bytes. No C, no
+# FFI, dependencies on std only.
+
+[package]
+name = "postgres"
+version = "0.1.0"
+description = "PostgreSQL wire protocol (framing, SCRAM-SHA-256, MD5) as pure Nova functions — sans-I/O"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nv-lang/nova-postgres"
+
+[lib]
+src = "src"
