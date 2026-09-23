@@ -1,0 +1,117 @@
+// src/postgres/bytes.nv — private big-endian/little-endian helpers shared by
+// the encoders and the decoder. All network-order (big-endian) per the
+// protocol; MD5 responses use little-endian where the MD5 spec does.
+//
+// Read helpers are total: a short buffer yields a structured error, never a
+// panic. Callers bounds-check before reading when they already know the size.
+
+module postgres
+
+/// Cursor over a byte buffer for incremental, non-panicking reads. The
+/// decoder drives one cursor per message payload; every read advances `pos`
+/// and reports absence via `Option`/`Result` instead of trapping.
+export type ByteCursor value {
+    ro buf []u8
+    mut pos int
+}
+
+/// New cursor positioned at the start of `buf`.
+export fn ByteCursor.new(buf []u8) -> ByteCursor =>
+    { buf, pos: 0 }
+
+/// Bytes still unread.
+export fn ByteCursor @remaining() -> int =>
+    @buf.len() - @pos
+
+/// Whether anything is left to read.
+export fn ByteCursor @is_empty() -> bool =>
+    @remaining() == 0
+
+/// Next single byte, if any.
+export fn ByteCursor mut @read_u8() -> Option[u8] {
+    if @pos >= @buf.len() { return None }
+    ro b = @buf[@pos]
+    @pos += 1
+    Some(b)
+}
+
+/// Next `n` bytes as an owning copy, if that many remain.
+export fn ByteCursor mut @read_bytes(n int) -> Option[[]u8] {
+    if n < 0 || @remaining() < n { return None }
+    mut out []u8 = []u8.new(cap: n)
+    out.append(@buf[@pos..@pos + n])
+    @pos += n
+    Some(out)
+}
+
+/// Big-endian unsigned 16-bit read.
+export fn ByteCursor mut @read_be_u16() -> Option[int] {
+    if @remaining() < 2 { return None }
+    ro v = be_u16(@buf, @pos)
+    @pos += 2
+    Some(v)
+}
+
+/// Big-endian unsigned 32-bit read.
+export fn ByteCursor mut @read_be_u32() -> Option[int] {
+    if @remaining() < 4 { return None }
+    ro v = be_u32(@buf, @pos)
+    @pos += 4
+    Some(v)
+}
+
+/// NUL-terminated string (protocol cstring) up to and excluding the NUL.
+export fn ByteCursor mut @read_cstr() -> Option[str] {
+    ro start = @pos
+    mut i = start
+    while i < @buf.len() {
+        if @buf[i] == 0 {
+            ro s = @buf[start..i].to_str().ok()?
+            @pos = i + 1
+            return Some(s)
+        }
+        i += 1
+    }
+    None
+}
+
+/// Append one byte.
+export fn push_u8(mut buf []u8, b u8) -> () {
+    buf.push(b)
+}
+
+/// Append a big-endian unsigned 16-bit value (low 16 bits of `v`).
+export fn push_be_u16(mut buf []u8, v int) -> () {
+    buf.push(((v >> 8) & 0xFF) as u8)
+    buf.push((v & 0xFF) as u8)
+}
+
+/// Append a big-endian unsigned 32-bit value (low 32 bits of `v`).
+export fn push_be_u32(mut buf []u8, v int) -> () {
+    buf.push(((v >> 24) & 0xFF) as u8)
+    buf.push(((v >> 16) & 0xFF) as u8)
+    buf.push(((v >> 8) & 0xFF) as u8)
+    buf.push((v & 0xFF) as u8)
+}
+
+/// Append raw bytes.
+export fn push_bytes(mut buf []u8, data []u8) -> () {
+    buf.append(data)
+}
+
+/// Append a NUL-terminated string (protocol cstring).
+export fn push_cstr(mut buf []u8, s str) -> () {
+    buf.append(s.bytes())
+    buf.push(0)
+}
+
+/// Big-endian unsigned 16-bit read at `offset`.
+fn be_u16(b []u8, offset int) -> int =>
+    ((b[offset] as int) << 8) | (b[offset + 1] as int)
+
+/// Big-endian unsigned 32-bit read at `offset`.
+fn be_u32(b []u8, offset int) -> int =>
+    ((b[offset] as int) << 24)
+    | ((b[offset + 1] as int) << 16)
+    | ((b[offset + 2] as int) << 8)
+    | (b[offset + 3] as int)

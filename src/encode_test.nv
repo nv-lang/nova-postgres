@@ -1,0 +1,108 @@
+// src/postgres/encode_test.nv — reference-byte tests for every client message
+// of the slice (plan 286 §Д8а criterion 2). Each expected frame is written
+// out byte by byte from the PostgreSQL documentation, «Frontend/Backend
+// Protocol» → «Message Formats»
+// (https://www.postgresql.org/docs/current/protocol-message-formats.html);
+// the section name is cited next to each reference.
+
+module postgres
+
+test "SSLRequest matches the documented bytes" {
+    // Reference: «Message Formats» → «SSLRequest» — length 8, magic code 80877103.
+    ro expected = x"00 00 00 08 04 D2 16 2F"
+    assert(ClientMessage.ssl_request() == expected)
+}
+
+test "StartupMessage matches the documented bytes" {
+    // Reference: «Message Formats» → «StartupMessage» — protocol 3.0 (196608),
+    // then key/value pairs user=postgres, database=mydb, then a terminating NUL.
+    ro expected = x"00 00 00 25 00 03 00 00 75 73 65 72 00 70 6F 73 74 67 72 65 73 00 64 61 74 61 62 61 73 65 00 6D 79 64 62 00 00"
+    ro params = [("user", "postgres"), ("database", "mydb")]
+    assert(ClientMessage.startup(params) == expected)
+}
+
+test "PasswordMessage matches the documented bytes" {
+    // Reference: «Message Formats» → «PasswordMessage» — tag 'p', the password
+    // as a NUL-terminated string.
+    ro expected = x"70 00 00 00 0B 73 65 63 72 65 74 00"
+    assert(ClientMessage.password("secret") == expected)
+}
+
+test "SASLInitialResponse matches the documented bytes" {
+    // Reference: «Message Formats» → «SASLInitialResponse» — tag 'p', mechanism
+    // cstring, int32 initial-response length, initial-response bytes.
+    ro expected = x"70 00 00 00 22 53 43 52 41 4D 2D 53 48 41 2D 32 35 36 00 00 00 00 0C 6E 2C 2C 6E 3D 75 2C 72 3D 61 62 63"
+    assert(ClientMessage.sasl_initial("SCRAM-SHA-256", "n,,n=u,r=abc".bytes()) == expected)
+}
+
+test "SASLResponse matches the documented bytes" {
+    // Reference: «Message Formats» → «SASLResponse» — tag 'p', SASL data
+    // (no NUL terminator).
+    ro expected = x"70 00 00 00 0A 63 3D 62 69 77 73"
+    assert(ClientMessage.sasl_response("c=biws".bytes()) == expected)
+}
+
+test "Query matches the documented bytes" {
+    // Reference: «Message Formats» → «Query» — tag 'Q', the query string as a
+    // NUL-terminated cstring.
+    ro expected = x"51 00 00 00 0D 53 45 4C 45 43 54 20 31 00"
+    assert(ClientMessage.query("SELECT 1") == expected)
+}
+
+test "Parse matches the documented bytes" {
+    // Reference: «Message Formats» → «Parse» — tag 'P', statement name cstring,
+    // query cstring, int16 parameter-count, int32 type OIDs.
+    ro expected = x"50 00 00 00 1D 73 74 6D 74 00 53 45 4C 45 43 54 20 24 31 00 00 02 00 00 00 17 00 00 00 19"
+    assert(ClientMessage.parse("stmt", "SELECT $1", [23, 25]) == expected)
+}
+
+test "Parse with no parameters matches the documented bytes" {
+    // Reference: «Message Formats» → «Parse» — zero parameters is an explicit
+    // int16 0.
+    ro expected = x"50 00 00 00 10 00 53 45 4C 45 43 54 20 31 00 00 00"
+    assert(ClientMessage.parse("", "SELECT 1", []) == expected)
+}
+
+test "Bind with a text parameter matches the documented bytes" {
+    // Reference: «Message Formats» → «Bind» — tag 'B', portal and statement
+    // cstrings, int16 format-count + formats, int16 parameter-count, each
+    // parameter as int32 length + bytes, int16 result-format-count + formats.
+    ro expected = x"42 00 00 00 11 00 00 00 00 00 01 00 00 00 01 35 00 00"
+    assert(ClientMessage.bind("", "", [], [ParamValue.text("5")], []) == expected)
+}
+
+test "Bind with binary and NULL parameters matches the documented bytes" {
+    // Reference: «Message Formats» → «Bind» — binary format code 1, a binary
+    // parameter (int32 length + raw bytes), NULL as int32 -1, one text
+    // result format.
+    ro expected = x"42 00 00 00 23 70 31 00 73 74 6D 74 31 00 00 01 00 01 00 02 00 00 00 04 00 00 00 2A FF FF FF FF 00 01 00 00"
+    ro params = [ParamValue.binary(x"00 00 00 2A"), ParamValue.null()]
+    assert(ClientMessage.bind("p1", "stmt1", [1], params, [0]) == expected)
+}
+
+test "Describe matches the documented bytes" {
+    // Reference: «Message Formats» → «Describe» — tag 'D', 'S' (statement) or
+    // 'P' (portal), then the name cstring.
+    ro expected = x"44 00 00 00 0A 53 73 74 6D 74 00"
+    assert(ClientMessage.describe('S' as u8, "stmt") == expected)
+}
+
+test "Execute matches the documented bytes" {
+    // Reference: «Message Formats» → «Execute» — tag 'E', portal cstring,
+    // int32 max-rows (0 = no limit).
+    ro expected = x"45 00 00 00 09 00 00 00 00 00"
+    assert(ClientMessage.execute("", 0) == expected)
+}
+
+test "Sync matches the documented bytes" {
+    // Reference: «Message Formats» → «Sync» — tag 'S', length 4, empty payload.
+    ro expected = x"53 00 00 00 04"
+    assert(ClientMessage.sync() == expected)
+}
+
+test "Terminate matches the documented bytes" {
+    // Reference: «Message Formats» → «Terminate» — tag 'X', length 4, empty
+    // payload.
+    ro expected = x"58 00 00 00 04"
+    assert(ClientMessage.terminate() == expected)
+}

@@ -1,0 +1,21 @@
+// `src/postgres/` — folder-module `postgres` (Nova module model: a folder whose
+// co-equal `.nv` files all declare the SAME `module postgres` merge into one
+// module — peer tests see private helpers of their peers, no cross-module
+// exports needed). Model and naming follow `std/src/collections/vec/` in the
+// nova repo 1:1 and the nova-bignum package.
+//
+// This is the PostgreSQL frontend/backend wire protocol (version 3.0) as pure
+// functions — sans-I/O. The package never opens a socket; the caller moves
+// bytes. Peer files and their roles:
+//
+//   error.nv    — `PostgresError`: one structural error domain for the package
+//   bytes.nv    — private big-endian/little-endian byte helpers (no panics)
+//   encode.nv   — client messages: message -> bytes
+//   decode.nv   — server messages: bytes -> message, incremental (need-more-bytes)
+//   scram.nv    — SCRAM-SHA-256 client (RFC 5802 / RFC 7677) as pure state steps
+//   md5.nv      — MD5 password response (legacy PostgreSQL authentication)
+//
+// Protocol reference: PostgreSQL documentation, «Frontend/Backend Protocol»
+// (postgresql.org/docs/current/protocol.html), sections «Message Formats» and
+// «SASL Authentication»; RFC 7677 for SCRAM-SHA-256.
+module postgres

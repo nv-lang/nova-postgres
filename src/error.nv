@@ -1,0 +1,54 @@
+// src/postgres/error.nv — `PostgresError`: the single structural error domain
+// of the package (module-conventions §3: one `XError` per domain, open kinds,
+// fallible constructors, no `Fail` for expected failures).
+
+module postgres
+
+import std.encoding.hex.{Hex}
+
+/// The one error type of the `postgres` package. Every fallible operation
+/// returns `Result[T, PostgresError]`; expected protocol failures (a malformed
+/// frame, an unknown message tag, a rejected SCRAM server signature) are
+/// values of this type, never panics and never `Fail` effects.
+///
+/// Inspect `kind` for the machine-readable classification and
+/// [`PostgresError @to_str`] for a human-readable message.
+export type PostgresError value {
+    ro kind PostgresErrorKind
+}
+
+/// Machine-readable classification of a [`PostgresError`]. Exhaustive on
+/// purpose: decoding never fails with an unnamed condition, and matching a
+/// new variant is a compile-time decision point for callers.
+export type PostgresErrorKind enum
+    /// Server message tag byte this package does not decode.
+    | UnknownTag { tag u8 }
+    /// Frame declared a length this package refuses to buffer (protocol
+    /// maximum is 1 GiB; anything above is a structural error, not
+    /// «need more bytes»).
+    | LengthOverflow { len int }
+    /// Message payload ended before a structurally complete field could be
+    /// read (unterminated string, truncated integer, ...).
+    | Truncated { what str }
+    /// An authentication exchange produced data that does not parse
+    /// (bad server-first/server-final attributes, missing mechanism, ...).
+    | Auth { what str }
+    /// SCRAM server signature did not match the expected value.
+    | BadServerSignature
+    /// A text field of a server message was not valid UTF-8.
+    | Utf8 { what str }
+
+/// Human-readable, single-line description of the error.
+export fn PostgresError @to_str() -> str =>
+    match @kind {
+        UnknownTag { tag } => "unknown server message tag 0x${Hex.encode(byte_vec(tag))}"
+        LengthOverflow { len } => "declared message length ${len.to_str()} exceeds the 1 GiB protocol maximum"
+        Truncated { what } => "truncated ${what}"
+        Auth { what } => "authentication failure: ${what}"
+        BadServerSignature => "SCRAM server signature mismatch"
+        Utf8 { what } => "invalid UTF-8 in ${what}"
+    }
+
+// One byte as a two-element Vec so `Hex.encode` can render it.
+fn byte_vec(b u8) -> []u8 =>
+    [b]

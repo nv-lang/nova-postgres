@@ -1,0 +1,196 @@
+// src/postgres/encode.nv — client message encoders: message -> bytes.
+//
+// Every encoder is a pure function returning the exact wire bytes, ready to
+// be written to a socket by the caller. Frame layout per the PostgreSQL
+// documentation, «Frontend/Backend Protocol» → «Message Formats»: a one-byte
+// tag, a big-endian int32 length covering itself and the payload, then the
+// payload. Startup-phase messages (SSLRequest, StartupMessage) carry no tag.
+//
+// Reference: https://www.postgresql.org/docs/current/protocol-message-formats.html
+
+module postgres
+
+// ──────────────────────────────────────────────────────────────────────────
+// ParamValue — one Bind parameter slot
+// ──────────────────────────────────────────────────────────────────────────
+
+/// One Bind parameter value: the bytes in the format declared for the Bind
+/// (text or binary), or `None` for SQL NULL.
+export type ParamValue value {
+    ro data Option[[]u8]
+}
+
+/// Text-format parameter from a string.
+export fn ParamValue.text(s str) -> ParamValue =>
+    { data: Some(s.bytes()) }
+
+/// Binary-format parameter from raw bytes.
+export fn ParamValue.binary(b []u8) -> ParamValue =>
+    { data: Some(b) }
+
+/// SQL NULL parameter.
+export fn ParamValue.null() -> ParamValue =>
+    { data: None }
+
+// ──────────────────────────────────────────────────────────────────────────
+// ClientMessage namespace — encoders for every frontend message of the slice
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Encoders of the PostgreSQL frontend (client) messages. Namespace type:
+/// static functions, no instance state — each call builds one complete wire
+/// frame. All functions are pure (no effects); the caller moves the bytes.
+export type ClientMessage
+
+/// SSLRequest: ask the server whether TLS is available. Payload is the magic
+/// code 80877103; the server answers with a single byte (`S`/`N`), which is
+/// NOT a framed message. The slice only frames the request; TLS itself is a
+/// later slice.
+export fn ClientMessage.ssl_request() -> []u8 {
+    mut out []u8 = []u8.new(cap: 8)
+    push_be_u32(out, 8)
+    push_be_u32(out, 80877103)
+    out
+}
+
+/// StartupMessage: open a connection. Protocol version 3.0 (196608), then
+/// the runtime parameters as key/value NUL-terminated pairs (user and
+/// database are the conventional minimum), then a terminating NUL.
+export fn ClientMessage.startup(params [](str, str)) -> []u8 {
+    mut payload []u8 = []u8.new(cap: 64)
+    push_be_u32(payload, 196608)
+    for (k, v) in params {
+        push_cstr(payload, k)
+        push_cstr(payload, v)
+    }
+    payload.push(0)
+    frame_untagged(payload)
+}
+
+/// PasswordMessage (tag `p`): cleartext or MD5 password response. The MD5
+/// form is built by [`md5_response`] and passed here as a plain string.
+export fn ClientMessage.password(pw str) -> []u8 {
+    mut payload []u8 = []u8.new(cap: pw.byte_len() + 1)
+    push_cstr(payload, pw)
+    frame('p' as u8, payload)
+}
+
+/// SASLInitialResponse (tag `p`): chosen mechanism, initial client response
+/// length, initial response bytes (the SCRAM client-first message).
+export fn ClientMessage.sasl_initial(mechanism str, initial []u8) -> []u8 {
+    mut payload []u8 = []u8.new(cap: mechanism.byte_len() + 5 + initial.len())
+    push_cstr(payload, mechanism)
+    push_be_u32(payload, initial.len())
+    push_bytes(payload, initial)
+    frame('p' as u8, payload)
+}
+
+/// SASLResponse (tag `p`): subsequent SCRAM data (the client-final message).
+export fn ClientMessage.sasl_response(data []u8) -> []u8 {
+    mut payload []u8 = []u8.new(cap: data.len())
+    push_bytes(payload, data)
+    frame('p' as u8, payload)
+}
+
+/// Query (tag `Q`): a simple-protocol query string.
+export fn ClientMessage.query(q str) -> []u8 {
+    mut payload []u8 = []u8.new(cap: q.byte_len() + 1)
+    push_cstr(payload, q)
+    frame('Q' as u8, payload)
+}
+
+/// Parse (tag `P`): prepare `query` as statement `statement` (empty = the
+/// unnamed statement), with `param_type_oids` giving the parameter data types
+/// (empty = let the server infer).
+export fn ClientMessage.parse(statement str, query str, param_type_oids []int) -> []u8 {
+    mut payload []u8 = []u8.new(cap: statement.byte_len() + query.byte_len() + 8)
+    push_cstr(payload, statement)
+    push_cstr(payload, query)
+    push_be_u16(payload, param_type_oids.len())
+    for oid in param_type_oids {
+        push_be_u32(payload, oid)
+    }
+    frame('P' as u8, payload)
+}
+
+/// Bind (tag `B`): instantiate portal `portal` from statement `statement`.
+/// `param_formats` and `result_formats` are per-parameter / per-result format
+/// codes (0 = text, 1 = binary; a single entry applies to all). `params`
+/// holds the parameter values in the declared formats; [`ParamValue.null`]
+/// encodes SQL NULL.
+export fn ClientMessage.bind(portal str, statement str, param_formats []int, params []ParamValue, result_formats []int) -> []u8 {
+    mut payload []u8 = []u8.new(cap: portal.byte_len() + statement.byte_len() + 16)
+    push_cstr(payload, portal)
+    push_cstr(payload, statement)
+    push_be_u16(payload, param_formats.len())
+    for f in param_formats {
+        push_be_u16(payload, f)
+    }
+    push_be_u16(payload, params.len())
+    for p in params {
+        match p.data {
+            Some(bytes) => {
+                push_be_u32(payload, bytes.len())
+                push_bytes(payload, bytes)
+            }
+            None => push_be_u32(payload, -1)
+        }
+    }
+    push_be_u16(payload, result_formats.len())
+    for f in result_formats {
+        push_be_u16(payload, f)
+    }
+    frame('B' as u8, payload)
+}
+
+/// Describe (tag `D`): describe statement `name` (`kind` = `S`) or portal
+/// `name` (`kind` = `P`). An empty name means the unnamed statement/portal.
+export fn ClientMessage.describe(kind u8, name str) -> []u8 {
+    mut payload []u8 = []u8.new(cap: name.byte_len() + 2)
+    payload.push(kind)
+    push_cstr(payload, name)
+    frame('D' as u8, payload)
+}
+
+/// Execute (tag `E`): run portal `portal`, returning at most `max_rows` rows
+/// (0 = no limit).
+export fn ClientMessage.execute(portal str, max_rows int) -> []u8 {
+    mut payload []u8 = []u8.new(cap: portal.byte_len() + 5)
+    push_cstr(payload, portal)
+    push_be_u32(payload, max_rows)
+    frame('E' as u8, payload)
+}
+
+/// Sync (tag `S`): end the current extended-protocol cycle. Fixed 5-byte
+/// frame, no payload.
+export fn ClientMessage.sync() -> []u8 {
+    mut payload []u8 = []u8.new(cap: 0)
+    frame('S' as u8, payload)
+}
+
+/// Terminate (tag `X`): close the connection politely. Fixed 5-byte frame,
+/// no payload.
+export fn ClientMessage.terminate() -> []u8 {
+    mut payload []u8 = []u8.new(cap: 0)
+    frame('X' as u8, payload)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Framing
+// ──────────────────────────────────────────────────────────────────────────
+
+// Tagged frame: tag byte, big-endian length (covers itself + payload), payload.
+fn frame(tag u8, payload []u8) -> []u8 {
+    mut out []u8 = []u8.new(cap: 5 + payload.len())
+    out.push(tag)
+    push_be_u32(out, 4 + payload.len())
+    push_bytes(out, payload)
+    out
+}
+
+// Untagged frame (startup phase): big-endian length, payload.
+fn frame_untagged(payload []u8) -> []u8 {
+    mut out []u8 = []u8.new(cap: 4 + payload.len())
+    push_be_u32(out, 4 + payload.len())
+    push_bytes(out, payload)
+    out
+}
