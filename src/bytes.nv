@@ -60,6 +60,19 @@ export fn ByteCursor mut @read_be_u32() -> Option[int] {
     Some(v)
 }
 
+/// Big-endian SIGNED 32-bit read (protocol `int32`: DataRow NULL is -1,
+/// typmod is -1).
+export fn ByteCursor mut @read_be_i32() -> Option[int] {
+    if @remaining() < 4 { return None }
+    ro v = be_u32(@buf, @pos)
+    @pos += 4
+    if v >= 0x80000000 {
+        Some(v - 0x100000000)
+    } else {
+        Some(v)
+    }
+}
+
 /// NUL-terminated string (protocol cstring) up to and excluding the NUL.
 export fn ByteCursor mut @read_cstr() -> Option[str] {
     ro start = @pos

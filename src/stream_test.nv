@@ -1,0 +1,120 @@
+// src/postgres/stream_test.nv — the sans-I/O property (plan 286 §Д8а
+// criterion 4): a stream of two (and more) messages, cut at EVERY point,
+// decodes incrementally to the same messages. The consumer feeds bytes as
+// they arrive from the socket; the decoder never needs the whole frame up
+// front.
+
+module postgres
+
+// Feed `stream` to the incremental decoder one byte at a time — every
+// possible cut point — and collect the messages.
+fn feed_byte_by_byte(stream []u8) -> []ServerMessage {
+    mut buf []u8 = []u8.new()
+    mut got []ServerMessage = []ServerMessage.new()
+    for b in stream {
+        buf.push(b)
+        match ServerMessage.decode(buf) {
+            Err(e) => assert(false, "mid-stream byte errored: ${e.to_str()}")
+            Ok(NeedMoreBytes) => ()
+            Ok(Message { msg, consumed }) => {
+                got.push(msg)
+                buf = buf[consumed..]
+            }
+        }
+    }
+    got
+}
+
+fn concat2(a []u8, b []u8) -> []u8 {
+    mut out []u8 = []u8.new(cap: a.len() + b.len())
+    out.append(a)
+    out.append(b)
+    out
+}
+
+test "two-message stream cut at every point decodes to the same two messages" {
+    ro auth_ok = x"52 00 00 00 08 00 00 00 00"
+    ro ready = x"5A 00 00 00 05 49"
+    ro stream = concat2(auth_ok, ready)
+
+    ro incremental = feed_byte_by_byte(stream)
+    assert(incremental.len() == 2)
+    match incremental[0] {
+        AuthenticationOk => ()
+        _ => assert(false, "first message wrong")
+    }
+    match incremental[1] {
+        ReadyForQuery { status } => assert(status == 'I' as u8)
+        _ => assert(false, "second message wrong")
+    }
+
+    // Whole-buffer decode must agree with the incremental decode.
+    match ServerMessage.decode_all(stream) {
+        Ok(whole) => {
+            assert(whole.len() == 2)
+            match whole[1] {
+                ReadyForQuery { status } => assert(status == 'I' as u8)
+                _ => assert(false, "decode_all second message wrong")
+            }
+        }
+        Err(e) => assert(false, "decode_all errored: ${e.to_str()}")
+    }
+}
+
+test "startup-phase stream of four messages survives every cut" {
+    // AuthenticationOk, ParameterStatus(server_version), BackendKeyData,
+    // ReadyForQuery — the exact startup sequence of a real server.
+    ro auth_ok = x"52 00 00 00 08 00 00 00 00"
+    ro param = x"53 00 00 00 19 63 6C 69 65 6E 74 5F 65 6E 63 6F 64 69 6E 67 00 55 54 46 38 00"
+    ro key_data = x"4B 00 00 00 0C 00 00 04 D2 00 00 16 2E"
+    ro ready = x"5A 00 00 00 05 49"
+    ro stream = concat2(concat2(auth_ok, param), concat2(key_data, ready))
+
+    ro incremental = feed_byte_by_byte(stream)
+    assert(incremental.len() == 4)
+    match incremental[1] {
+        ParameterStatus { name, value } => {
+            assert(name == "client_encoding")
+            assert(value == "UTF8")
+        }
+        _ => assert(false, "ParameterStatus wrong")
+    }
+    match incremental[2] {
+        BackendKeyData { process_id, secret_key } => {
+            assert(process_id == 1234)
+            assert(secret_key == 5678)
+        }
+        _ => assert(false, "BackendKeyData wrong")
+    }
+}
+
+test "decode_all stops quietly at a trailing incomplete frame" {
+    // AuthenticationOk followed by the first 3 bytes of a ReadyForQuery —
+    // decode_all returns the complete message and ignores the tail.
+    ro stream = x"52 00 00 00 08 00 00 00 00 5A 00 00"
+    match ServerMessage.decode_all(stream) {
+        Ok(msgs) => assert(msgs.len() == 1)
+        Err(e) => assert(false, "decode_all errored: ${e.to_str()}")
+    }
+}
+
+test "query response stream cut at every point decodes to the same messages" {
+    // RowDescription + DataRow + CommandComplete + ReadyForQuery, as a real
+    // server answers `SELECT 1`.
+    ro row_desc = x"54 00 00 00 1A 00 01 69 00 00 00 00 00 00 00 00 00 00 17 00 04 FF FF FF FF 00 00"
+    ro data_row = x"44 00 00 00 0B 00 01 00 00 00 01 31"
+    ro complete = x"43 00 00 00 0D 53 45 4C 45 43 54 20 31 00"
+    ro ready = x"5A 00 00 00 05 49"
+    ro stream = concat2(concat2(row_desc, data_row), concat2(complete, ready))
+
+    ro incremental = feed_byte_by_byte(stream)
+    assert(incremental.len() == 4)
+    match incremental[1] {
+        DataRow { values } => assert(values[0].data == Some("1".bytes()))
+        _ => assert(false, "DataRow wrong")
+    }
+    match incremental[2] {
+        CommandComplete { tag } => assert(tag == "SELECT 1")
+        _ => assert(false, "CommandComplete wrong")
+    }
+}

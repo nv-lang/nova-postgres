@@ -1,0 +1,399 @@
+// src/postgres/decode_test.nv — reference-byte tests for every server message
+// of the slice (plan 286 §Д8а criterion 3). Each reference frame is written
+// out byte by byte from the PostgreSQL documentation, «Frontend/Backend
+// Protocol» → «Message Formats»
+// (https://www.postgresql.org/docs/current/protocol-message-formats.html);
+// the section name is cited next to each reference. Every proper prefix of
+// every reference answers NeedMoreBytes — the incremental property.
+
+module postgres
+
+// Every proper prefix of a complete single-message frame is "need more
+// bytes": never a message, never an error, never a panic.
+fn assert_prefixes_need_more(reference []u8) {
+    mut n = 0
+    while n < reference.len() {
+        match ServerMessage.decode(reference[..n]) {
+            Ok(NeedMoreBytes) => ()
+            Ok(Message { msg, consumed }) => assert(false, "prefix of ${n.to_str()} bytes decoded as a full message")
+            Err(e) => assert(false, "prefix of ${n.to_str()} bytes errored: ${e.to_str()}")
+        }
+        n += 1
+    }
+}
+
+fn assert_decodes(reference []u8) -> ServerMessage {
+    match ServerMessage.decode(reference) {
+        Ok(Message { msg, consumed }) => {
+            assert(consumed == reference.len(), "consumed ${consumed.to_str()} != frame ${reference.len().to_str()} bytes")
+            msg
+        }
+        Ok(NeedMoreBytes) => {
+            assert(false, "complete reference frame answered NeedMoreBytes")
+            AuthenticationOk
+        }
+        Err(e) => {
+            assert(false, "reference frame errored: ${e.to_str()}")
+            AuthenticationOk
+        }
+    }
+}
+
+test "empty buffer answers NeedMoreBytes" {
+    match ServerMessage.decode([]) {
+        Ok(NeedMoreBytes) => ()
+        Ok(Message { msg, consumed }) => assert(false, "decoded a message from an empty buffer")
+        Err(e) => assert(false, "empty buffer errored: ${e.to_str()}")
+    }
+}
+
+test "AuthenticationOk matches the documented bytes" {
+    // Reference: «Message Formats» → «AuthenticationOk» — tag 'R', length 8,
+    // int32 code 0.
+    ro reference = x"52 00 00 00 08 00 00 00 00"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        AuthenticationOk => ()
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "AuthenticationCleartextPassword matches the documented bytes" {
+    // Reference: «Message Formats» → «AuthenticationCleartextPassword» — tag
+    // 'R', length 8, int32 code 3.
+    ro reference = x"52 00 00 00 08 00 00 00 03"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        AuthenticationCleartextPassword => ()
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "AuthenticationMD5Password matches the documented bytes" {
+    // Reference: «Message Formats» → «AuthenticationMD5Password» — tag 'R',
+    // length 12, int32 code 5, 4-byte salt.
+    ro reference = x"52 00 00 00 0C 00 00 00 05 01 02 03 04"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        AuthenticationMd5Password { salt } => {
+            assert(salt[0] == 1 && salt[1] == 2 && salt[2] == 3 && salt[3] == 4)
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "AuthenticationSASL matches the documented bytes" {
+    // Reference: «Message Formats» → «AuthenticationSASL» — tag 'R', int32
+    // code 10, mechanism cstrings, terminating NUL.
+    ro reference = x"52 00 00 00 17 00 00 00 0A 53 43 52 41 4D 2D 53 48 41 2D 32 35 36 00 00"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        AuthenticationSasl { mechanisms } => {
+            assert(mechanisms.len() == 1)
+            assert(mechanisms[0] == "SCRAM-SHA-256")
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "AuthenticationSASLContinue matches the documented bytes" {
+    // Reference: «Message Formats» → «AuthenticationSASLContinue» — tag 'R',
+    // int32 code 11, SASL data (rest of the frame).
+    ro reference = x"52 00 00 00 0B 00 00 00 0B 61 62 63"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        AuthenticationSaslContinue { data } => assert(data == "abc".bytes())
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "AuthenticationSASLFinal matches the documented bytes" {
+    // Reference: «Message Formats» → «AuthenticationSASLFinal» — tag 'R',
+    // int32 code 12, SASL data (rest of the frame).
+    ro reference = x"52 00 00 00 0E 00 00 00 0C 76 3D 36 72 72 69"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        AuthenticationSaslFinal { data } => assert(data == "v=6rri".bytes())
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "ParameterStatus matches the documented bytes" {
+    // Reference: «Message Formats» → «ParameterStatus» — tag 'S', name cstring,
+    // value cstring.
+    ro reference = x"53 00 00 00 19 63 6C 69 65 6E 74 5F 65 6E 63 6F 64 69 6E 67 00 55 54 46 38 00"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        ParameterStatus { name, value } => {
+            assert(name == "client_encoding")
+            assert(value == "UTF8")
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "BackendKeyData matches the documented bytes" {
+    // Reference: «Message Formats» → «BackendKeyData» — tag 'K', int32 process
+    // id, int32 secret key.
+    ro reference = x"4B 00 00 00 0C 00 00 04 D2 00 00 16 2E"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        BackendKeyData { process_id, secret_key } => {
+            assert(process_id == 1234)
+            assert(secret_key == 5678)
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "ReadyForQuery matches the documented bytes" {
+    // Reference: «Message Formats» → «ReadyForQuery» — tag 'Z', length 5, one
+    // transaction-status byte ('I' = idle).
+    ro reference = x"5A 00 00 00 05 49"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        ReadyForQuery { status } => assert(status == 'I' as u8)
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "RowDescription matches the documented bytes" {
+    // Reference: «Message Formats» → «RowDescription» — tag 'T', int16 field
+    // count, then per field: name cstring, int32 table oid, int16 column,
+    // int32 type oid, int16 type size, int32 type modifier, int16 format.
+    // One field: name "i", no source table, type int4 (oid 23), size 4,
+    // typmod -1, text format.
+    ro reference = x"54 00 00 00 1A 00 01 69 00 00 00 00 00 00 00 00 00 00 17 00 04 FF FF FF FF 00 00"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        RowDescription { fields } => {
+            assert(fields.len() == 1)
+            ro f = fields[0]
+            assert(f.name == "i")
+            assert(f.table_oid == 0)
+            assert(f.column == 0)
+            assert(f.type_oid == 23)
+            assert(f.type_size == 4)
+            assert(f.type_modifier == -1)
+            assert(f.format == 0)
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "DataRow with a value matches the documented bytes" {
+    // Reference: «Message Formats» → «DataRow» — tag 'D', int16 column count,
+    // per column int32 length + bytes.
+    ro reference = x"44 00 00 00 0B 00 01 00 00 00 01 31"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        DataRow { values } => {
+            assert(values.len() == 1)
+            assert(values[0].data == Some("1".bytes()))
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "DataRow with NULL matches the documented bytes" {
+    // Reference: «Message Formats» → «DataRow» — NULL is int32 length -1.
+    ro reference = x"44 00 00 00 0A 00 01 FF FF FF FF"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        DataRow { values } => {
+            assert(values.len() == 1)
+            assert(values[0].data == None)
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "CommandComplete matches the documented bytes" {
+    // Reference: «Message Formats» → «CommandComplete» — tag 'C', command tag
+    // as a cstring.
+    ro reference = x"43 00 00 00 0D 53 45 4C 45 43 54 20 31 00"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        CommandComplete { tag } => assert(tag == "SELECT 1")
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "ErrorResponse matches the documented bytes" {
+    // Reference: «Message Formats» → «ErrorResponse» — tag 'E', then (code
+    // byte, cstring value) pairs, terminated by a zero code byte. Fields:
+    // S=ERROR, C=42601, M="syntax error".
+    ro reference = x"45 00 00 00 21 53 45 52 52 4F 52 00 43 34 32 36 30 31 00 4D 73 79 6E 74 61 78 20 65 72 72 6F 72 00 00"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        ErrorResponse { fields } => {
+            assert(fields.len() == 3)
+            assert(fields[0].code == 'S' as u8 && fields[0].value == "ERROR")
+            assert(fields[1].code == 'C' as u8 && fields[1].value == "42601")
+            assert(fields[2].code == 'M' as u8 && fields[2].value == "syntax error")
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "NoticeResponse matches the documented bytes" {
+    // Reference: «Message Formats» → «NoticeResponse» — tag 'N', same field
+    // layout as ErrorResponse.
+    ro reference = x"4E 00 00 00 15 53 4E 4F 54 49 43 45 00 56 4E 4F 54 49 43 45 00 00"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        NoticeResponse { fields } => {
+            assert(fields.len() == 2)
+            assert(fields[0].code == 'S' as u8 && fields[0].value == "NOTICE")
+            assert(fields[1].code == 'V' as u8 && fields[1].value == "NOTICE")
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "ParseComplete matches the documented bytes" {
+    // Reference: «Message Formats» → «ParseComplete» — tag '1', length 4.
+    ro reference = x"31 00 00 00 04"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        ParseComplete => ()
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "BindComplete matches the documented bytes" {
+    // Reference: «Message Formats» → «BindComplete» — tag '2', length 4.
+    ro reference = x"32 00 00 00 04"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        BindComplete => ()
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "NoData matches the documented bytes" {
+    // Reference: «Message Formats» → «NoData» — tag 'n', length 4.
+    ro reference = x"6E 00 00 00 04"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        NoData => ()
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "EmptyQueryResponse matches the documented bytes" {
+    // Reference: «Message Formats» → «EmptyQueryResponse» — tag 'I', length 4.
+    ro reference = x"49 00 00 00 04"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        EmptyQueryResponse => ()
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "unknown tag is a structural error" {
+    // 'w' is not a backend message tag; decoding must fail structurally,
+    // not panic and not ask for more bytes.
+    ro frame = x"77 00 00 00 04"
+    match ServerMessage.decode(frame) {
+        Err(e) => match e.kind {
+            UnknownTag { tag } => assert(tag == 'w' as u8)
+            LengthOverflow { len } => assert(false, "wrong kind")
+            BadLength { len } => assert(false, "wrong kind")
+            Truncated { what } => assert(false, "wrong kind")
+            Malformed { what } => assert(false, "wrong kind")
+            Auth { what } => assert(false, "wrong kind")
+            BadServerSignature => assert(false, "wrong kind")
+            Utf8 { what } => assert(false, "wrong kind")
+        }
+        Ok(NeedMoreBytes) => assert(false, "unknown tag answered NeedMoreBytes")
+        Ok(Message { msg, consumed }) => assert(false, "unknown tag decoded as a message")
+    }
+}
+
+test "length below 4 is a structural error" {
+    ro frame = x"5A 00 00 00 03"
+    match ServerMessage.decode(frame) {
+        Err(e) => match e.kind {
+            BadLength { len } => assert(len == 3)
+            UnknownTag { tag } => assert(false, "wrong kind")
+            LengthOverflow { len } => assert(false, "wrong kind")
+            Truncated { what } => assert(false, "wrong kind")
+            Malformed { what } => assert(false, "wrong kind")
+            Auth { what } => assert(false, "wrong kind")
+            BadServerSignature => assert(false, "wrong kind")
+            Utf8 { what } => assert(false, "wrong kind")
+        }
+        Ok(_) => assert(false, "bad length decoded")
+    }
+}
+
+test "length above the 1 GiB protocol maximum is a structural error" {
+    ro frame = x"5A 40 00 00 01"
+    match ServerMessage.decode(frame) {
+        Err(e) => match e.kind {
+            LengthOverflow { len } => assert(len > MAX_MESSAGE_LEN)
+            UnknownTag { tag } => assert(false, "wrong kind")
+            BadLength { len } => assert(false, "wrong kind")
+            Truncated { what } => assert(false, "wrong kind")
+            Malformed { what } => assert(false, "wrong kind")
+            Auth { what } => assert(false, "wrong kind")
+            BadServerSignature => assert(false, "wrong kind")
+            Utf8 { what } => assert(false, "wrong kind")
+        }
+        Ok(_) => assert(false, "oversized length decoded")
+    }
+}
+
+test "truncated DataRow payload is a structural error" {
+    // Declared length covers the count but not the value length that follows.
+    ro frame = x"44 00 00 00 06 00 01"
+    match ServerMessage.decode(frame) {
+        Err(e) => match e.kind {
+            Truncated { what } => assert(what == "DataRow value length")
+            UnknownTag { tag } => assert(false, "wrong kind")
+            LengthOverflow { len } => assert(false, "wrong kind")
+            BadLength { len } => assert(false, "wrong kind")
+            Malformed { what } => assert(false, "wrong kind")
+            Auth { what } => assert(false, "wrong kind")
+            BadServerSignature => assert(false, "wrong kind")
+            Utf8 { what } => assert(false, "wrong kind")
+        }
+        Ok(_) => assert(false, "truncated payload decoded")
+    }
+}
+
+test "unterminated cstring is a structural error" {
+    ro frame = x"43 00 00 00 05 41"
+    match ServerMessage.decode(frame) {
+        Err(e) => match e.kind {
+            Truncated { what } => assert(what == "CommandComplete tag")
+            UnknownTag { tag } => assert(false, "wrong kind")
+            LengthOverflow { len } => assert(false, "wrong kind")
+            BadLength { len } => assert(false, "wrong kind")
+            Malformed { what } => assert(false, "wrong kind")
+            Auth { what } => assert(false, "wrong kind")
+            BadServerSignature => assert(false, "wrong kind")
+            Utf8 { what } => assert(false, "wrong kind")
+        }
+        Ok(_) => assert(false, "unterminated cstring decoded")
+    }
+}
+
+test "trailing bytes past the documented layout are a structural error" {
+    // AuthenticationOk with a trailing byte: length 9 instead of 8.
+    ro frame = x"52 00 00 00 09 00 00 00 00 FF"
+    match ServerMessage.decode(frame) {
+        Err(e) => match e.kind {
+            Malformed { what } => assert(what == "AuthenticationOk")
+            UnknownTag { tag } => assert(false, "wrong kind")
+            LengthOverflow { len } => assert(false, "wrong kind")
+            BadLength { len } => assert(false, "wrong kind")
+            Truncated { what } => assert(false, "wrong kind")
+            Auth { what } => assert(false, "wrong kind")
+            BadServerSignature => assert(false, "wrong kind")
+            Utf8 { what } => assert(false, "wrong kind")
+        }
+        Ok(_) => assert(false, "frame with trailing bytes decoded")
+    }
+}
