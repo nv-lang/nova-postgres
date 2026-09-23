@@ -1,0 +1,195 @@
+// src/postgres/scram.nv — SCRAM-SHA-256 client (RFC 5802, profiled for
+// PostgreSQL by RFC 7677) as pure state steps. No clock, no randomness, no
+// socket: the caller injects the client nonce (any unique, printable string)
+// and moves the messages. The exchange is a three-step state machine:
+//
+//   let mut client = ScramClient.new(user, password, client_nonce)
+//   client.client_first()                  -> "n,,n=user,r=<nonce>"
+//   client.respond_server_first(server)    -> "c=biws,r=<nonce>,p=<proof>"
+//   client.verify_server_final(server)     -> Ok(()) or BadServerSignature
+//
+// References: https://www.rfc-editor.org/rfc/rfc5802 (mechanism),
+// https://www.rfc-editor.org/rfc/rfc7677.html § 3 (SHA-256 profile and the
+// example exchange used verbatim in scram_test.nv).
+
+module postgres
+
+import std.crypto.sha256.{Sha256}
+import std.crypto.hmac.{HmacSha256}
+import std.encoding.base64.{Base64}
+
+// SCRAM channel binding data for PostgreSQL: base64("n,,") — no channel
+// binding, no authzid. Constant per RFC 5802.
+const SCRAM_GS2_HEADER = "n,,"
+const SCRAM_CHANNEL_BINDING_B64 = "biws"
+const SCRAM_CLIENT_KEY_LABEL = "Client Key"
+const SCRAM_SERVER_KEY_LABEL = "Server Key"
+
+/// SCRAM-SHA-256 client state. A pure state machine: construction fixes the
+/// user/password/client nonce; `respond_server_first` absorbs the server's
+/// challenge and derives the keys; `verify_server_final` checks the server's
+/// signature. Fields are private to the exchange — read via the step results.
+export type ScramClient {
+    ro user str
+    ro password str
+    ro client_nonce str
+    ro client_first_bare str
+    mut auth_message str
+    mut server_key [32]u8
+    mut responded bool
+}
+
+/// New client for `user`/`password` with a caller-chosen `client_nonce`
+/// (unique per attempt; the consumer generates it, this package stays pure).
+export fn ScramClient.new(user str, password str, client_nonce str) -> ScramClient {
+    ro bare = "n=${scram_escape(user)},r=${client_nonce}"
+    ScramClient {
+        user,
+        password,
+        client_nonce,
+        client_first_bare: bare,
+        auth_message: "",
+        server_key: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        responded: false,
+    }
+}
+
+/// Client-first message: GS2 header plus the bare part. Sent as the initial
+/// response of SASLInitialResponse.
+export fn ScramClient @client_first() -> str =>
+    SCRAM_GS2_HEADER + @client_first_bare
+
+/// Answer the server-first message (`r=<nonce>,s=<b64 salt>,i=<iterations>`)
+/// with the client-final message (`c=biws,r=<full nonce>,p=<b64 proof>`).
+/// Errors structurally: unparsable attributes, a server nonce that does not
+/// extend the client nonce, a bad salt/iteration encoding.
+export fn ScramClient mut @respond_server_first(server_first str) -> Result[str, PostgresError] {
+    ro server_nonce = scram_attribute(server_first, "r")?
+    if !server_nonce.starts_with(@client_nonce) {
+        return Err(PostgresError { kind: Auth { what: "server nonce does not extend the client nonce" } })
+    }
+    ro salt_b64 = scram_attribute(server_first, "s")?
+    ro iterations_text = scram_attribute(server_first, "i")?
+    ro iterations = match iterations_text.to_int() {
+        Ok(n) => n
+        Err(_) => return Err(PostgresError { kind: Auth { what: "non-integer iteration count" } })
+    }
+    if iterations < 1 {
+        return Err(PostgresError { kind: Auth { what: "iteration count below 1" } })
+    }
+    ro salt = match Base64.decode(salt_b64) {
+        Ok(b) => b
+        Err(_) => return Err(PostgresError { kind: Auth { what: "invalid base64 salt" } })
+    }
+
+    // SaltedPassword = PBKDF2-HMAC-SHA-256(password, salt, i).
+    ro salted = pbkdf2_hmac_sha256(@password.bytes(), salt, iterations)
+    ro client_key = HmacSha256.compute(salted[..32], SCRAM_CLIENT_KEY_LABEL.bytes())
+    ro stored_key = Sha256.hash(client_key[..32])
+
+    // ClientKey XOR ClientSignature, over AuthMessage.
+    ro client_final_without_proof = "c=${SCRAM_CHANNEL_BINDING_B64},r=${server_nonce}"
+    ro auth_message = "${@client_first_bare},${server_first},${client_final_without_proof}"
+    ro client_signature = HmacSha256.compute(stored_key[..32], auth_message.bytes())
+    mut proof [32]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    mut j = 0
+    while j < 32 {
+        proof[j] = client_key[j] ^ client_signature[j]
+        j += 1
+    }
+
+    @auth_message = auth_message
+    @server_key = HmacSha256.compute(salted[..32], SCRAM_SERVER_KEY_LABEL.bytes())
+    @responded = true
+    Ok("${client_final_without_proof},p=${Base64.encode(proof[..32])}")
+}
+
+/// Verify the server-final message (`v=<b64 signature>`). Constant-time
+/// comparison; any deviation is `PostgresErrorKind.BadServerSignature`.
+export fn ScramClient mut @verify_server_final(server_final str) -> Result[(), PostgresError] {
+    if !@responded {
+        return Err(PostgresError { kind: Auth { what: "server-final received before server-first" } })
+    }
+    ro signature_b64 = scram_attribute(server_final, "v")?
+    ro expected = match Base64.decode(signature_b64) {
+        Ok(b) => b
+        Err(_) => return Err(PostgresError { kind: Auth { what: "invalid base64 server signature" } })
+    }
+    ro computed = HmacSha256.compute(@server_key[..32], @auth_message.bytes())
+    if !constant_time_bytes_eq(expected, computed[..32]) {
+        return Err(PostgresError { kind: BadServerSignature })
+    }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// SCRAM helpers
+// ──────────────────────────────────────────────────────────────────────────
+
+// RFC 5802 § 5.1 username escaping: '=' as "=3D", ',' as "=2C".
+fn scram_escape(s str) -> str {
+    consume buf = StringBuilder.new()
+    for c in s.chars() {
+        if c == '=' {
+            buf.append("=3D")
+        } else if c == ',' {
+            buf.append("=2C")
+        } else {
+            buf.append(c)
+        }
+    }
+    buf.into_str()
+}
+
+// Value of the `key` attribute in a comma-separated SCRAM attribute list.
+// Absent key or missing '=' is an Auth error, never a panic.
+fn scram_attribute(message str, key str) -> Result[str, PostgresError] {
+    for part in message.split(",").collect() {
+        match part.split_once("=") {
+            Some((k, v)) => {
+                if k == key {
+                    return Ok(v)
+                }
+            }
+            None => ()
+        }
+    }
+    Err(PostgresError { kind: Auth { what: "missing ${key} attribute" } })
+}
+
+// PBKDF2 with HMAC-SHA-256, one 32-byte block (enough for SHA-256 output):
+// U1 = HMAC(pw, salt || INT32BE(1)); Ui = HMAC(pw, U(i-1));
+// result = U1 ^ U2 ^ ... ^ Uc. Iteration counts here are the full c.
+fn pbkdf2_hmac_sha256(password []u8, salt []u8, iterations int) -> [32]u8 {
+    mut block []u8 = []u8.new(cap: salt.len() + 4)
+    block.append(salt)
+    push_be_u32(block, 1)
+    mut u = HmacSha256.compute(password, block)
+    mut result = u
+    mut i = 1
+    while i < iterations {
+        u = HmacSha256.compute(password, u[..32])
+        mut j = 0
+        while j < 32 {
+            result[j] = result[j] ^ u[j]
+            j += 1
+        }
+        i += 1
+    }
+    result
+}
+
+// Constant-time equality of two byte strings: no early exit, no length leak
+// beyond the inevitable difference in compared prefix.
+fn constant_time_bytes_eq(a []u8, b []u8) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    mut diff int = 0
+    mut i = 0
+    while i < a.len() {
+        diff = diff | ((a[i] as int) ^ (b[i] as int))
+        i += 1
+    }
+    diff == 0
+}

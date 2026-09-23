@@ -1,0 +1,106 @@
+// src/postgres/scram_test.nv — the RFC 7677 § 3 example exchange, byte for
+// byte (plan 286 §Д8а criterion 5). The vectors are quoted verbatim from
+// https://www.rfc-editor.org/rfc/rfc7677.html:
+//   client-first:  n,,n=user,r=rOprNGfwEbeRWgbNEkqO
+//   server-first:  r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,
+//                  s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096
+//   client-final:  c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,
+//                  p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=
+//   server-final:  v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=
+// with password "pencil".
+
+module postgres
+
+const RFC7677_USER = "user"
+const RFC7677_PASSWORD = "pencil"
+const RFC7677_CLIENT_NONCE = "rOprNGfwEbeRWgbNEkqO"
+const RFC7677_SERVER_FIRST = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+const RFC7677_CLIENT_FINAL = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+const RFC7677_SERVER_FINAL = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+
+test "RFC 7677 example: client-first byte-for-byte" {
+    ro client = ScramClient.new(RFC7677_USER, RFC7677_PASSWORD, RFC7677_CLIENT_NONCE)
+    assert(client.client_first() == "n,,n=user,r=rOprNGfwEbeRWgbNEkqO")
+}
+
+test "RFC 7677 example: client-final proof byte-for-byte" {
+    mut client = ScramClient.new(RFC7677_USER, RFC7677_PASSWORD, RFC7677_CLIENT_NONCE)
+    match client.respond_server_first(RFC7677_SERVER_FIRST) {
+        Ok(client_final) => assert(client_final == RFC7677_CLIENT_FINAL)
+        Err(e) => assert(false, "respond_server_first errored: ${e.to_str()}")
+    }
+}
+
+test "RFC 7677 example: server signature accepted" {
+    mut client = ScramClient.new(RFC7677_USER, RFC7677_PASSWORD, RFC7677_CLIENT_NONCE)
+    match client.respond_server_first(RFC7677_SERVER_FIRST) {
+        Ok(_) => ()
+        Err(e) => assert(false, "respond_server_first errored: ${e.to_str()}")
+    }
+    match client.verify_server_final(RFC7677_SERVER_FINAL) {
+        Ok(()) => ()
+        Err(e) => assert(false, "valid server signature rejected: ${e.to_str()}")
+    }
+}
+
+test "any other server signature is a structural error" {
+    mut client = ScramClient.new(RFC7677_USER, RFC7677_PASSWORD, RFC7677_CLIENT_NONCE)
+    match client.respond_server_first(RFC7677_SERVER_FIRST) {
+        Ok(_) => ()
+        Err(e) => assert(false, "respond_server_first errored: ${e.to_str()}")
+    }
+    // Same shape, wrong value: the proof computed for a different exchange.
+    match client.verify_server_final("v=7ssjUWTBi34XrSS/xuvq+nNiWTWo/eC6oMUKsk2+6H5=") {
+        Ok(()) => assert(false, "forged server signature accepted")
+        Err(e) => match e.kind {
+            BadServerSignature => ()
+            UnknownTag { tag } => assert(false, "wrong kind")
+            LengthOverflow { len } => assert(false, "wrong kind")
+            BadLength { len } => assert(false, "wrong kind")
+            Truncated { what } => assert(false, "wrong kind")
+            Malformed { what } => assert(false, "wrong kind")
+            Auth { what } => assert(false, "wrong kind")
+            Utf8 { what } => assert(false, "wrong kind")
+        }
+    }
+}
+
+test "server nonce not extending the client nonce is a structural error" {
+    mut client = ScramClient.new(RFC7677_USER, RFC7677_PASSWORD, RFC7677_CLIENT_NONCE)
+    ro bad_server_first = "r=aaaaaaaaaaaaaaaaaaaaaa%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    match client.respond_server_first(bad_server_first) {
+        Ok(_) => assert(false, "foreign server nonce accepted")
+        Err(e) => match e.kind {
+            Auth { what } => assert(what == "server nonce does not extend the client nonce")
+            UnknownTag { tag } => assert(false, "wrong kind")
+            LengthOverflow { len } => assert(false, "wrong kind")
+            BadLength { len } => assert(false, "wrong kind")
+            Truncated { what } => assert(false, "wrong kind")
+            Malformed { what } => assert(false, "wrong kind")
+            BadServerSignature => assert(false, "wrong kind")
+            Utf8 { what } => assert(false, "wrong kind")
+        }
+    }
+}
+
+test "verify before respond is a structural error" {
+    mut client = ScramClient.new(RFC7677_USER, RFC7677_PASSWORD, RFC7677_CLIENT_NONCE)
+    match client.verify_server_final(RFC7677_SERVER_FINAL) {
+        Ok(()) => assert(false, "verify before respond accepted")
+        Err(e) => match e.kind {
+            Auth { what } => assert(what == "server-final received before server-first")
+            UnknownTag { tag } => assert(false, "wrong kind")
+            LengthOverflow { len } => assert(false, "wrong kind")
+            BadLength { len } => assert(false, "wrong kind")
+            Truncated { what } => assert(false, "wrong kind")
+            Malformed { what } => assert(false, "wrong kind")
+            BadServerSignature => assert(false, "wrong kind")
+            Utf8 { what } => assert(false, "wrong kind")
+        }
+    }
+}
+
+test "usernames with SCRAM-special characters are escaped" {
+    ro client = ScramClient.new("a=b,c", RFC7677_PASSWORD, "nonce")
+    assert(client.client_first() == "n,,n=a=3Db=2Cc,r=nonce")
+}

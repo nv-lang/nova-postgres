@@ -1,0 +1,32 @@
+// src/postgres/md5.nv — MD5 password response for the legacy PostgreSQL
+// MD5 authentication (AuthenticationMD5Password, code 5). The result is the
+// string to place in a PasswordMessage:
+//
+//   "md5" + hex(md5(hex(md5(password + username)) + salt))
+//
+// MD5 here is what the PostgreSQL server demands for compatibility; the
+// modern path is SCRAM-SHA-256 (scram.nv). Reference: PostgreSQL
+// documentation, «Frontend/Backend Protocol» → «MD5 Authentication».
+
+module postgres
+
+import std.crypto.md5.{Md5}
+
+/// Build the MD5 password response for `user`/`password` and the 4-byte
+/// `salt` from AuthenticationMD5Password. Returns the PasswordMessage
+/// payload (including the "md5" prefix), ready for [`ClientMessage.password`].
+export fn md5_response(user str, password str, salt [4]u8) -> str {
+    mut inner_input []u8 = []u8.new(cap: password.byte_len() + user.byte_len())
+    inner_input.append(password.bytes())
+    inner_input.append(user.bytes())
+    ro inner_hex = Md5.hash_str(inner_input)
+
+    mut outer_input []u8 = []u8.new(cap: 32 + 4)
+    outer_input.append(inner_hex.bytes())
+    outer_input.push(salt[0])
+    outer_input.push(salt[1])
+    outer_input.push(salt[2])
+    outer_input.push(salt[3])
+    ro outer_hex = Md5.hash_str(outer_input)
+    "md5${outer_hex}"
+}
