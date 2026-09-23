@@ -1,0 +1,266 @@
+// examples/smoke/src/main.nv — live smoke of the postgres wire protocol
+// package against a throwaway PostgreSQL in Docker (nova plan 286, slice
+// D8a, criterion 6). This example is the ONLY place a socket moves; the
+// protocol core under src/ stays pure.
+//
+//   docker run --rm -d --name nova-pg-smoke -e POSTGRES_PASSWORD=smoke -p 55440:5432 postgres:15
+//   ./nova.sh build examples/smoke/src/main.nv -o target/smoke.exe
+//   ./target/smoke.exe
+//   docker stop nova-pg-smoke
+//
+// Flow: startup -> SCRAM-SHA-256 (MD5/cleartext also handled) -> SELECT 1 ->
+// RowDescription, DataRow with the value 1, CommandComplete, ReadyForQuery.
+
+module main
+
+import std.net.{TcpStream, real_net}
+import std.encoding.base64.{Base64}
+import postgres.{ClientMessage, ServerMessage, ScramClient, ErrorField, md5_response}
+
+const HOST_PORT = "127.0.0.1:55440"
+const SMOKE_USER = "postgres"
+const SMOKE_PASSWORD = "smoke"
+const SMOKE_QUERY = "SELECT 1"
+
+fn main() {
+    with Net = real_net() {
+        match smoke() {
+            Ok(detail) => println("SMOKE OK: ${detail}")
+            Err(reason) => println("SMOKE FAIL: ${reason}")
+        }
+    }
+}
+
+// The whole exchange; Ok carries the one-line summary, Err a reason.
+fn smoke() Net Random -> Result[str, str] {
+    consume stream = match TcpStream.connect(HOST_PORT) {
+        Ok(consume s) => s
+        Err(e) => return Err("connect ${HOST_PORT}: ${e.to_str()}")
+    }
+    // The stream closes itself at scope end (std.net auto-cleanup); sending
+    // Terminate is the polite explicit goodbye below.
+    mut pending []u8 = []u8.new()
+    println("smoke: connected to ${HOST_PORT}")
+    ro auth = authenticate(stream, pending, SMOKE_USER, SMOKE_PASSWORD)?
+    println("smoke: ${auth}")
+    ro ready = wait_ready(stream, pending)?
+    println("smoke: ${ready}")
+    ro result = run_query(stream, pending, SMOKE_QUERY)?
+    println("smoke: ${result}")
+    match stream.write_all(ClientMessage.terminate()) {
+        Ok(()) => ()
+        Err(e) => return Err("write Terminate: ${e.to_str()}")
+    }
+    Ok("startup -> auth -> ${SMOKE_QUERY} -> ReadyForQuery")
+}
+
+// ─── Reading: socket bytes in, whole messages out ──────────────────────────
+
+// Read from the socket until one full server message is buffered, decode it
+// incrementally, and return it. `pending` keeps the not-yet-decoded tail:
+// grown in place by `append`, compacted in place after each message.
+fn read_one(mut stream TcpStream, mut pending []u8) -> Result[ServerMessage, str] {
+    loop {
+        match ServerMessage.decode(pending) {
+            Ok(Message { msg, consumed }) => {
+                mut rest []u8 = []u8.new(cap: pending.len() - consumed)
+                rest.append(pending[consumed..])
+                pending.truncate(0)
+                pending.append(rest)
+                return Ok(msg)
+            }
+            Ok(NeedMoreBytes) => {
+                ro chunk = match stream.read_bytes(65536) {
+                    Ok(b) => b
+                    Err(e) => return Err("read: ${e.to_str()}")
+                }
+                if chunk.len() == 0 {
+                    return Err("read: server closed the connection")
+                }
+                pending.append(chunk)
+            }
+            Err(e) => return Err("decode: ${e.to_str()}")
+        }
+    }
+}
+
+fn write_frame(mut stream TcpStream, frame []u8, what str) -> Result[(), str] {
+    match stream.write_all(frame) {
+        Ok(()) => Ok(())
+        Err(e) => Err("write ${what}: ${e.to_str()}")
+    }
+}
+
+// ─── Authentication ─────────────────────────────────────────────────────────
+
+fn authenticate(mut stream TcpStream, mut pending []u8, user str, password str) -> Result[str, str] {
+    ro startup = ClientMessage.startup([("user", user), ("database", user)])
+    write_frame(stream, startup, "StartupMessage")?
+    loop {
+        ro msg = read_one(stream, pending)?
+        match msg {
+            AuthenticationOk => return Ok("AuthenticationOk (trust)")
+            AuthenticationCleartextPassword => {
+                write_frame(stream, ClientMessage.password(password), "PasswordMessage")?
+            }
+            AuthenticationMd5Password { salt } => {
+                ro response = md5_response(user, password, salt)
+                write_frame(stream, ClientMessage.password(response), "PasswordMessage")?
+            }
+            AuthenticationSasl { mechanisms } => {
+                mut scram_offered = false
+                for m in mechanisms {
+                    if m == "SCRAM-SHA-256" {
+                        scram_offered = true
+                    }
+                }
+                if !scram_offered {
+                    return Err("server offers no SCRAM-SHA-256")
+                }
+                println("smoke: server offered SCRAM-SHA-256")
+                return sasl_exchange(stream, pending, user, password)
+            }
+            ErrorResponse { fields } => return Err(server_error_text(fields))
+            _ => return Err("unexpected message during authentication")
+        }
+    }
+}
+
+fn sasl_exchange(mut stream TcpStream, mut pending []u8, user str, password str) -> Result[str, str] {
+    // The client nonce comes from the OS CSPRNG here at the edge; the pure
+    // ScramClient consumes it as a plain string.
+    ro nonce = Base64.encode(Random.bytes(18))
+    mut client = ScramClient.new(user, password, nonce)
+    ro initial = ClientMessage.sasl_initial("SCRAM-SHA-256", client.client_first().bytes())
+    write_frame(stream, initial, "SASLInitialResponse")?
+    loop {
+        ro msg = read_one(stream, pending)?
+        match msg {
+            AuthenticationSaslContinue { data } => {
+                ro server_first = match data.to_str() {
+                    Ok(s) => s
+                    Err(_) => return Err("SASLContinue data is not UTF-8")
+                }
+                ro client_final = match client.respond_server_first(server_first) {
+                    Ok(s) => s
+                    Err(e) => return Err("SCRAM respond: ${e.to_str()}")
+                }
+                write_frame(stream, ClientMessage.sasl_response(client_final.bytes()), "SASLResponse")?
+            }
+            AuthenticationSaslFinal { data } => {
+                ro server_final = match data.to_str() {
+                    Ok(s) => s
+                    Err(_) => return Err("SASLFinal data is not UTF-8")
+                }
+                match client.verify_server_final(server_final) {
+                    Ok(()) => println("smoke: SCRAM server signature verified")
+                    Err(e) => return Err("SCRAM verify: ${e.to_str()}")
+                }
+            }
+            AuthenticationOk => return Ok("AuthenticationOk (SCRAM-SHA-256)")
+            ErrorResponse { fields } => return Err(server_error_text(fields))
+            other => return Err("unexpected message during SASL exchange: ${debug_name(other)}")
+        }
+    }
+}
+
+// ─── Startup completion and the query round ─────────────────────────────────
+
+fn wait_ready(mut stream TcpStream, mut pending []u8) -> Result[str, str] {
+    mut params = 0
+    loop {
+        ro msg = read_one(stream, pending)?
+        match msg {
+            ParameterStatus { name, value } => {
+                params += 1
+                if name == "server_version" {
+                    println("smoke: ParameterStatus server_version=${value}")
+                }
+            }
+            BackendKeyData { process_id, .. } => println("smoke: BackendKeyData pid=${process_id.to_str()}")
+            ReadyForQuery { status } => {
+                ro st = (status as int).to_char() ?? '?'
+                return Ok("ReadyForQuery (${st}) after ${params.to_str()} ParameterStatus")
+            }
+            NoticeResponse { .. } => ()
+            ErrorResponse { fields } => return Err(server_error_text(fields))
+            _ => return Err("unexpected message before ReadyForQuery")
+        }
+    }
+}
+
+fn run_query(mut stream TcpStream, mut pending []u8, query str) -> Result[str, str] {
+    write_frame(stream, ClientMessage.query(query), "Query")?
+    mut desc = ""
+    mut row_value = ""
+    mut cmd_tag = ""
+    loop {
+        ro msg = read_one(stream, pending)?
+        match msg {
+            RowDescription { fields } => {
+                ro first = fields[0]
+                desc = "RowDescription ${fields.len().to_str()} field(s), first '${first.name}' type_oid=${first.type_oid.to_str()}"
+            }
+            DataRow { values } => {
+                row_value = match values[0].data {
+                    Some(b) => match b.to_str() {
+                        Ok(s) => s
+                        Err(_) => return Err("DataRow value is not UTF-8")
+                    }
+                    None => "NULL"
+                }
+            }
+            CommandComplete { tag } => {
+                cmd_tag = tag
+            }
+            ReadyForQuery { .. } => break
+            NoticeResponse { .. } => ()
+            ErrorResponse { fields } => return Err(server_error_text(fields))
+            _ => return Err("unexpected message during query")
+        }
+    }
+    if row_value != "1" {
+        return Err("expected DataRow value '1', got '${row_value}'")
+    }
+    Ok("${desc}; DataRow '${row_value}'; CommandComplete '${cmd_tag}'")
+}
+
+fn server_error_text(fields []ErrorField) -> str {    mut msg = ""
+    mut code = ""
+    for f in fields {
+        if f.code == 'M' as u8 {
+            msg = f.value
+        }
+        if f.code == 'C' as u8 {
+            code = f.value
+        }
+    }
+    if msg == "" {
+        "server error (sqlstate ${code})"
+    } else {
+        "server error: ${msg} (sqlstate ${code})"
+    }
+}
+
+// Debug helper: which server message variant is this.
+fn debug_name(msg ServerMessage) -> str =>
+    match msg {
+        AuthenticationOk => "AuthenticationOk"
+        AuthenticationCleartextPassword => "AuthenticationCleartextPassword"
+        AuthenticationMd5Password { salt } => "AuthenticationMd5Password"
+        AuthenticationSasl { mechanisms } => "AuthenticationSasl"
+        AuthenticationSaslContinue { data } => "AuthenticationSaslContinue"
+        AuthenticationSaslFinal { data } => "AuthenticationSaslFinal"
+        ParameterStatus { name, value } => "ParameterStatus"
+        BackendKeyData { process_id, secret_key } => "BackendKeyData"
+        ReadyForQuery { status } => "ReadyForQuery"
+        RowDescription { fields } => "RowDescription"
+        DataRow { values } => "DataRow"
+        CommandComplete { tag } => "CommandComplete"
+        ErrorResponse { fields } => "ErrorResponse"
+        NoticeResponse { fields } => "NoticeResponse"
+        ParseComplete => "ParseComplete"
+        BindComplete => "BindComplete"
+        NoData => "NoData"
+        EmptyQueryResponse => "EmptyQueryResponse"
+    }

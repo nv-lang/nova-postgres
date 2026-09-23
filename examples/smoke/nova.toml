@@ -1,0 +1,12 @@
+# nova.toml — nova-postgres example: live smoke against a throwaway
+# PostgreSQL in Docker. Mini-package depending on the parent package by
+# path (same layout as the nova-polaris examples); the protocol core stays
+# pure, this example is the only place a socket moves.
+
+[package]
+name = "postgres-example-smoke"
+version = "0.1.0"
+description = "Live smoke of the postgres wire protocol package: startup -> SCRAM-SHA-256 -> SELECT 1"
+
+[dependencies]
+postgres = { path = "../.." }
