@@ -13,3 +13,7 @@ BRIEF*.md
 PLAN_*_LOCAL.md
 opencode.json
 nova.sh
+
+# Minimal compiler-behaviour repro programs (D8b §3) — local working material,
+# the integrator re-runs them from the hand-over, they are not package code.
+repro-local/
