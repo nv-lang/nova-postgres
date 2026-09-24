@@ -68,7 +68,7 @@ export fn ClientMessage.startup(params [](str, str)) -> []u8 {
         payload.write_cstr(v)
     }
     payload.write_byte(0)
-    frame_untagged(payload)
+    frame_untagged(payload.into_bytes())
 }
 
 /// PasswordMessage (tag `p`): cleartext or MD5 password response. The MD5
@@ -76,7 +76,7 @@ export fn ClientMessage.startup(params [](str, str)) -> []u8 {
 export fn ClientMessage.password(pw str) -> []u8 {
     mut payload = WriteBuffer.new(cap: pw.byte_len() + 1)
     payload.write_cstr(pw)
-    frame('p' as u8, payload)
+    frame('p' as u8, payload.into_bytes())
 }
 
 /// SASLInitialResponse (tag `p`): chosen mechanism, initial client response
@@ -86,21 +86,21 @@ export fn ClientMessage.sasl_initial(mechanism str, initial []u8) -> []u8 {
     payload.write_cstr(mechanism)
     payload.write_u32_be(initial.len() as u32)
     payload.write_bytes(initial)
-    frame('p' as u8, payload)
+    frame('p' as u8, payload.into_bytes())
 }
 
 /// SASLResponse (tag `p`): subsequent SCRAM data (the client-final message).
 export fn ClientMessage.sasl_response(data []u8) -> []u8 {
     mut payload = WriteBuffer.new(cap: data.len())
     payload.write_bytes(data)
-    frame('p' as u8, payload)
+    frame('p' as u8, payload.into_bytes())
 }
 
 /// Query (tag `Q`): a simple-protocol query string.
 export fn ClientMessage.query(q str) -> []u8 {
     mut payload = WriteBuffer.new(cap: q.byte_len() + 1)
     payload.write_cstr(q)
-    frame('Q' as u8, payload)
+    frame('Q' as u8, payload.into_bytes())
 }
 
 /// Parse (tag `P`): prepare `query` as statement `statement` (empty = the
@@ -114,7 +114,7 @@ export fn ClientMessage.parse(statement str, query str, param_type_oids []int) -
     for oid in param_type_oids {
         payload.write_u32_be(oid as u32)
     }
-    frame('P' as u8, payload)
+    frame('P' as u8, payload.into_bytes())
 }
 
 /// Bind (tag `B`): instantiate portal `portal` from statement `statement`.
@@ -144,7 +144,7 @@ export fn ClientMessage.bind(portal str, statement str, param_formats []int, par
     for f in result_formats {
         payload.write_u16_be(f as u16)
     }
-    frame('B' as u8, payload)
+    frame('B' as u8, payload.into_bytes())
 }
 
 /// Describe (tag `D`): describe statement `name` (`kind` = `S`) or portal
@@ -153,7 +153,7 @@ export fn ClientMessage.describe(kind u8, name str) -> []u8 {
     mut payload = WriteBuffer.new(cap: name.byte_len() + 2)
     payload.write_byte(kind)
     payload.write_cstr(name)
-    frame('D' as u8, payload)
+    frame('D' as u8, payload.into_bytes())
 }
 
 /// Execute (tag `E`): run portal `portal`, returning at most `max_rows` rows
@@ -162,21 +162,19 @@ export fn ClientMessage.execute(portal str, max_rows int) -> []u8 {
     mut payload = WriteBuffer.new(cap: portal.byte_len() + 5)
     payload.write_cstr(portal)
     payload.write_u32_be(max_rows as u32)
-    frame('E' as u8, payload)
+    frame('E' as u8, payload.into_bytes())
 }
 
 /// Sync (tag `S`): end the current extended-protocol cycle. Fixed 5-byte
 /// frame, no payload.
 export fn ClientMessage.sync() -> []u8 {
-    mut payload = WriteBuffer.new(cap: 0)
-    frame('S' as u8, payload)
+    frame('S' as u8, []u8.new())
 }
 
 /// Terminate (tag `X`): close the connection politely. Fixed 5-byte frame,
 /// no payload.
 export fn ClientMessage.terminate() -> []u8 {
-    mut payload = WriteBuffer.new(cap: 0)
-    frame('X' as u8, payload)
+    frame('X' as u8, []u8.new())
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -191,18 +189,18 @@ fn WriteBuffer mut @write_cstr(s str) -> () {
 }
 
 // Tagged frame: tag byte, big-endian length (covers itself + payload), payload.
-fn frame(tag u8, payload WriteBuffer) -> []u8 {
+fn frame(tag u8, payload []u8) -> []u8 {
     mut out = WriteBuffer.new(cap: 5 + payload.len())
     out.write_byte(tag)
     out.write_u32_be((4 + payload.len()) as u32)
-    out.write_bytes(payload.clone().into_bytes())
+    out.write_bytes(payload)
     out.into_bytes()
 }
 
 // Untagged frame (startup phase): big-endian length, payload.
-fn frame_untagged(payload WriteBuffer) -> []u8 {
+fn frame_untagged(payload []u8) -> []u8 {
     mut out = WriteBuffer.new(cap: 4 + payload.len())
     out.write_u32_be((4 + payload.len()) as u32)
-    out.write_bytes(payload.clone().into_bytes())
+    out.write_bytes(payload)
     out.into_bytes()
 }
