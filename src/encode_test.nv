@@ -13,6 +13,14 @@ test "SSLRequest matches the documented bytes" {
     assert(ClientMessage.ssl_request() == expected)
 }
 
+test "CancelRequest matches the documented bytes" {
+    // Reference: «Message Formats» → «CancelRequest» — length 16, cancel code
+    // 80877102, then process id and secret key as big-endian int32 (here:
+    // 12345 = 0x3039, 67890 = 0x10932).
+    ro expected = x"00 00 00 10 04 D2 16 2E 00 00 30 39 00 01 09 32"
+    assert(ClientMessage.cancel_request(12345, 67890) == expected)
+}
+
 test "StartupMessage matches the documented bytes" {
     // Reference: «Message Formats» → «StartupMessage» — protocol 3.0 (196608),
     // then key/value pairs user=postgres, database=mydb, then a terminating NUL.
