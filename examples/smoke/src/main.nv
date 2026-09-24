@@ -35,7 +35,7 @@ fn main() {
 fn smoke() Net Random -> Result[str, str] {
     consume stream = match TcpStream.connect(HOST_PORT) {
         Ok(consume s) => s
-        Err(e) => return Err("connect ${HOST_PORT}: ${e.to_str()}")
+        Err(e) => return Err("connect ${HOST_PORT}: ${e}")
     }
     // The stream closes itself at scope end (std.net auto-cleanup); sending
     // Terminate is the polite explicit goodbye below.
@@ -49,7 +49,7 @@ fn smoke() Net Random -> Result[str, str] {
     println("smoke: ${result}")
     match stream.write_all(ClientMessage.terminate()) {
         Ok(()) => ()
-        Err(e) => return Err("write Terminate: ${e.to_str()}")
+        Err(e) => return Err("write Terminate: ${e}")
     }
     Ok("startup -> auth -> ${SMOKE_QUERY} -> ReadyForQuery")
 }
@@ -72,14 +72,14 @@ fn read_one(mut stream TcpStream, mut pending []u8) -> Result[ServerMessage, str
             Ok(NeedMoreBytes) => {
                 ro chunk = match stream.read_bytes(65536) {
                     Ok(b) => b
-                    Err(e) => return Err("read: ${e.to_str()}")
+                    Err(e) => return Err("read: ${e}")
                 }
                 if chunk.len() == 0 {
                     return Err("read: server closed the connection")
                 }
                 pending.append(chunk)
             }
-            Err(e) => return Err("decode: ${e.to_str()}")
+            Err(e) => return Err("decode: ${e}")
         }
     }
 }
@@ -87,7 +87,7 @@ fn read_one(mut stream TcpStream, mut pending []u8) -> Result[ServerMessage, str
 fn write_frame(mut stream TcpStream, frame []u8, what str) -> Result[(), str] {
     match stream.write_all(frame) {
         Ok(()) => Ok(())
-        Err(e) => Err("write ${what}: ${e.to_str()}")
+        Err(e) => Err("write ${what}: ${e}")
     }
 }
 
@@ -143,7 +143,7 @@ fn sasl_exchange(mut stream TcpStream, mut pending []u8, user str, password str)
                 }
                 ro client_final = match client.respond_server_first(server_first) {
                     Ok(s) => s
-                    Err(e) => return Err("SCRAM respond: ${e.to_str()}")
+                    Err(e) => return Err("SCRAM respond: ${e}")
                 }
                 write_frame(stream, ClientMessage.sasl_response(client_final.bytes()), "SASLResponse")?
             }
@@ -154,7 +154,7 @@ fn sasl_exchange(mut stream TcpStream, mut pending []u8, user str, password str)
                 }
                 match client.verify_server_final(server_final) {
                     Ok(()) => println("smoke: SCRAM server signature verified")
-                    Err(e) => return Err("SCRAM verify: ${e.to_str()}")
+                    Err(e) => return Err("SCRAM verify: ${e}")
                 }
             }
             AuthenticationOk => return Ok("AuthenticationOk (SCRAM-SHA-256)")
@@ -177,10 +177,10 @@ fn wait_ready(mut stream TcpStream, mut pending []u8) -> Result[str, str] {
                     println("smoke: ParameterStatus server_version=${value}")
                 }
             }
-            BackendKeyData { process_id, .. } => println("smoke: BackendKeyData pid=${process_id.to_str()}")
+            BackendKeyData { process_id, .. } => println("smoke: BackendKeyData pid=${process_id}")
             ReadyForQuery { status } => {
                 ro st = (status as int).to_char() ?? '?'
-                return Ok("ReadyForQuery (${st}) after ${params.to_str()} ParameterStatus")
+                return Ok("ReadyForQuery (${st}) after ${params} ParameterStatus")
             }
             NoticeResponse { .. } => ()
             ErrorResponse { fields } => return Err(server_error_text(fields))
@@ -199,7 +199,7 @@ fn run_query(mut stream TcpStream, mut pending []u8, query str) -> Result[str, s
         match msg {
             RowDescription { fields } => {
                 ro first = fields[0]
-                desc = "RowDescription ${fields.len().to_str()} field(s), first '${first.name}' type_oid=${first.type_oid.to_str()}"
+                desc = "RowDescription ${fields.len()} field(s), first '${first.name}' type_oid=${first.type_oid}"
             }
             DataRow { values } => {
                 row_value = match values[0].data {

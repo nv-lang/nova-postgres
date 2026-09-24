@@ -14,7 +14,7 @@ fn feed_byte_by_byte(stream []u8) -> []ServerMessage {
     for b in stream {
         buf.push(b)
         match ServerMessage.decode(buf) {
-            Err(e) => assert(false, "mid-stream byte errored: ${e.to_str()}")
+            Err(e) => assert(false, "mid-stream byte errored: ${e}")
             Ok(NeedMoreBytes) => ()
             Ok(Message { msg, consumed }) => {
                 got.push(msg)
@@ -57,7 +57,7 @@ test "two-message stream cut at every point decodes to the same two messages" {
                 _ => assert(false, "decode_all second message wrong")
             }
         }
-        Err(e) => assert(false, "decode_all errored: ${e.to_str()}")
+        Err(e) => assert(false, "decode_all errored: ${e}")
     }
 }
 
@@ -94,7 +94,7 @@ test "decode_all stops quietly at a trailing incomplete frame" {
     ro stream = x"52 00 00 00 08 00 00 00 00 5A 00 00"
     match ServerMessage.decode_all(stream) {
         Ok(msgs) => assert(msgs.len() == 1)
-        Err(e) => assert(false, "decode_all errored: ${e.to_str()}")
+        Err(e) => assert(false, "decode_all errored: ${e}")
     }
 }
 

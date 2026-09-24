@@ -15,8 +15,8 @@ fn assert_prefixes_need_more(reference []u8) {
     while n < reference.len() {
         match ServerMessage.decode(reference[..n]) {
             Ok(NeedMoreBytes) => ()
-            Ok(Message { msg, consumed }) => assert(false, "prefix of ${n.to_str()} bytes decoded as a full message")
-            Err(e) => assert(false, "prefix of ${n.to_str()} bytes errored: ${e.to_str()}")
+            Ok(Message { msg, consumed }) => assert(false, "prefix of ${n} bytes decoded as a full message")
+            Err(e) => assert(false, "prefix of ${n} bytes errored: ${e}")
         }
         n += 1
     }
@@ -25,7 +25,7 @@ fn assert_prefixes_need_more(reference []u8) {
 fn assert_decodes(reference []u8) -> ServerMessage {
     match ServerMessage.decode(reference) {
         Ok(Message { msg, consumed }) => {
-            assert(consumed == reference.len(), "consumed ${consumed.to_str()} != frame ${reference.len().to_str()} bytes")
+            assert(consumed == reference.len(), "consumed ${consumed} != frame ${reference.len()} bytes")
             msg
         }
         Ok(NeedMoreBytes) => {
@@ -33,7 +33,7 @@ fn assert_decodes(reference []u8) -> ServerMessage {
             AuthenticationOk
         }
         Err(e) => {
-            assert(false, "reference frame errored: ${e.to_str()}")
+            assert(false, "reference frame errored: ${e}")
             AuthenticationOk
         }
     }
@@ -43,7 +43,7 @@ test "empty buffer answers NeedMoreBytes" {
     match ServerMessage.decode([]) {
         Ok(NeedMoreBytes) => ()
         Ok(Message { msg, consumed }) => assert(false, "decoded a message from an empty buffer")
-        Err(e) => assert(false, "empty buffer errored: ${e.to_str()}")
+        Err(e) => assert(false, "empty buffer errored: ${e}")
     }
 }
 

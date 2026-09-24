@@ -47,8 +47,8 @@ export type PostgresErrorKind enum
 export fn PostgresError @to_str() -> str =>
     match @kind {
         UnknownTag { tag } => "unknown server message tag 0x${Hex.encode(byte_vec(tag))}"
-        LengthOverflow { len } => "declared message length ${len.to_str()} exceeds the 1 GiB protocol maximum"
-        BadLength { len } => "declared message length ${len.to_str()} is below the minimum of 4"
+        LengthOverflow { len } => "declared message length ${len} exceeds the 1 GiB protocol maximum"
+        BadLength { len } => "declared message length ${len} is below the minimum of 4"
         Truncated { what } => "truncated ${what}"
         Malformed { what } => "malformed ${what}"
         Auth { what } => "authentication failure: ${what}"

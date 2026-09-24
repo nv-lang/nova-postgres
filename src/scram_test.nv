@@ -27,7 +27,7 @@ test "RFC 7677 example: client-final proof byte-for-byte" {
     mut client = ScramClient.new(RFC7677_USER, RFC7677_PASSWORD, RFC7677_CLIENT_NONCE)
     match client.respond_server_first(RFC7677_SERVER_FIRST) {
         Ok(client_final) => assert(client_final == RFC7677_CLIENT_FINAL)
-        Err(e) => assert(false, "respond_server_first errored: ${e.to_str()}")
+        Err(e) => assert(false, "respond_server_first errored: ${e}")
     }
 }
 
@@ -35,11 +35,11 @@ test "RFC 7677 example: server signature accepted" {
     mut client = ScramClient.new(RFC7677_USER, RFC7677_PASSWORD, RFC7677_CLIENT_NONCE)
     match client.respond_server_first(RFC7677_SERVER_FIRST) {
         Ok(_) => ()
-        Err(e) => assert(false, "respond_server_first errored: ${e.to_str()}")
+        Err(e) => assert(false, "respond_server_first errored: ${e}")
     }
     match client.verify_server_final(RFC7677_SERVER_FINAL) {
         Ok(()) => ()
-        Err(e) => assert(false, "valid server signature rejected: ${e.to_str()}")
+        Err(e) => assert(false, "valid server signature rejected: ${e}")
     }
 }
 
@@ -47,7 +47,7 @@ test "any other server signature is a structural error" {
     mut client = ScramClient.new(RFC7677_USER, RFC7677_PASSWORD, RFC7677_CLIENT_NONCE)
     match client.respond_server_first(RFC7677_SERVER_FIRST) {
         Ok(_) => ()
-        Err(e) => assert(false, "respond_server_first errored: ${e.to_str()}")
+        Err(e) => assert(false, "respond_server_first errored: ${e}")
     }
     // Same shape, wrong value: the proof computed for a different exchange.
     match client.verify_server_final("v=7ssjUWTBi34XrSS/xuvq+nNiWTWo/eC6oMUKsk2+6H5=") {
