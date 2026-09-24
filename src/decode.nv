@@ -129,7 +129,7 @@ fn decode_payload(tag u8, mut cur ReadBuffer) -> Result[ServerMessage, PostgresE
     if tag == 'T' as u8 { return decode_row_description(cur) }
     if tag == 'D' as u8 { return decode_data_row(cur) }
     if tag == 'C' as u8 {
-        ro cmd_tag = need_cstr(cur, "CommandComplete tag")?
+        ro cmd_tag = cur.read_cstr("CommandComplete tag")?
         finish(cur, "CommandComplete")?
         return Ok(CommandComplete { tag: cmd_tag })
     }
@@ -176,7 +176,7 @@ fn decode_auth(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
         // NUL — so the terminator is consumed explicitly, not as an empty name.
         mut mechs []str = []str.new()
         while cur.remaining() > 1 {
-            mechs.push(need_cstr(cur, "SASL mechanism")?)
+            mechs.push(cur.read_cstr("SASL mechanism")?)
         }
         ro terminator = need_u8(cur, "SASL mechanism list terminator")?
         if terminator != 0 {
@@ -196,8 +196,8 @@ fn decode_auth(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
 }
 
 fn decode_parameter_status(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
-    ro name = need_cstr(cur, "ParameterStatus name")?
-    ro value = need_cstr(cur, "ParameterStatus value")?
+    ro name = cur.read_cstr("ParameterStatus name")?
+    ro value = cur.read_cstr("ParameterStatus value")?
     finish(cur, "ParameterStatus")?
     Ok(ParameterStatus { name, value })
 }
@@ -212,7 +212,7 @@ fn decode_row_description(mut cur ReadBuffer) -> Result[ServerMessage, PostgresE
     ro count = need_u16(cur, "RowDescription field count")?
     mut fields []RowField = []RowField.new(cap: count)
     for _ in 0..count {
-        ro name = need_cstr(cur, "RowDescription field name")?
+        ro name = cur.read_cstr("RowDescription field name")?
         ro table_oid = need_u32(cur, "RowDescription table oid")?
         ro column = need_u16(cur, "RowDescription column")?
         ro type_oid = need_u32(cur, "RowDescription type oid")?
@@ -258,7 +258,7 @@ fn decode_error_fields(mut cur ReadBuffer, notice bool) -> Result[ServerMessage,
     while true {
         ro code = need_u8(cur, "error/notice field code")?
         if code == 0 { break }
-        ro value = need_cstr(cur, "error/notice field value")?
+        ro value = cur.read_cstr("error/notice field value")?
         fields.push(ErrorField { code, value })
     }
     finish(cur, "ErrorResponse/NoticeResponse")?
@@ -304,10 +304,10 @@ fn need_i32(mut cur ReadBuffer, what str) -> Result[int, PostgresError] {
 // NUL-terminated string (protocol cstring). std ReadBuffer has no cstring
 // read; this walks bytes to the terminator. Unterminated or non-UTF-8 input
 // is a Truncated error, matching the rest of the need_* family.
-fn need_cstr(mut cur ReadBuffer, what str) -> Result[str, PostgresError] {
+fn ReadBuffer mut @read_cstr(what str) -> Result[str, PostgresError] {
     mut acc []u8 = []u8.new()
     while true {
-        match cur.read_u8() {
+        match @read_u8() {
             Ok(0) => break
             Ok(b) => acc.push(b)
             Err(_) => return Err(PostgresError { kind: Truncated { what } })
