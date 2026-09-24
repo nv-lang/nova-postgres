@@ -42,6 +42,10 @@ export type PostgresErrorKind enum
     | BadServerSignature
     /// A text field of a server message was not valid UTF-8.
     | Utf8 { what str }
+    /// The server sent a message its phase does not allow (DataRow before
+    /// RowDescription, ReadyForQuery during authentication, a query-progress
+    /// tag while idle, ...). A protocol violation, not a transport failure.
+    | Protocol { what str }
 
 /// Human-readable, single-line description of the error.
 export fn PostgresError @to_str() -> str =>
@@ -54,6 +58,7 @@ export fn PostgresError @to_str() -> str =>
         Auth { what } => "authentication failure: ${what}"
         BadServerSignature => "SCRAM server signature mismatch"
         Utf8 { what } => "invalid UTF-8 in ${what}"
+        Protocol { what } => "protocol violation: ${what}"
     }
 
 // One byte as a two-element Vec so `Hex.encode` can render it.

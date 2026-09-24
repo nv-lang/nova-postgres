@@ -1,0 +1,497 @@
+// src/postgres/session.nv — Session: the connection as a PURE state machine
+// (plan 286 §Д8б). Input: bytes arriving from the server. Output:
+// [`SessionEvent`]s and bytes to send (drained by the caller). Phases:
+//
+//   Authenticating → Startup → Ready ⇄ (QuerySimple | QueryExtended) → Closed
+//                                                          ↘ Failed
+//
+// No socket, no clock, no randomness inside: the caller injects the SCRAM
+// client nonce at construction (the network adapter draws it from the OS at
+// the edge). Authentication covers trust, cleartext, MD5 and SCRAM-SHA-256.
+// After an ErrorResponse mid-query the machine skips everything until the
+// ReadyForQuery that closes the cycle — that recovery is a slice criterion.
+//
+// Protocol reference: PostgreSQL documentation, «Frontend/Backend Protocol»
+// → «Message Flow» (Start-up, Simple Query, Extended Query) and «Message
+// Formats»; RFC 7677 for the SCRAM-SHA-256 profile.
+
+module postgres
+
+/// Phase of a [`Session`], exposed read-only. The lifecycle is
+/// `Authenticating → Startup → Ready`, then one `QuerySimple`/`QueryExtended`
+/// per query round, ending back in `Ready`; `Closed` is polite shutdown,
+/// `Failed` is an unrecoverable protocol/decode error (every further `feed`
+/// returns a structured error).
+export type SessionPhase enum
+    | Authenticating
+    | Startup
+    | Ready
+    | QuerySimple
+    | QueryExtended
+    | Closed
+    | Failed
+
+/// One step of the extended-protocol cycle the session currently expects.
+/// `ExtParse` → ParseComplete, `ExtBind` → BindComplete, `ExtDescribe` →
+/// RowDescription or NoData, `ExtExecute` → DataRow*/CommandComplete.
+export type ExtStage enum
+    | ExtParse
+    | ExtBind
+    | ExtDescribe
+    | ExtExecute
+
+/// Everything the application learns from the server, in order. Row values
+/// arrive raw — `Some(bytes)` in the column's negotiated format (text unless
+/// a binary result format was requested), `None` for SQL NULL. Type codecs
+/// are a later slice; this slice does not interpret bytes.
+export type SessionEvent enum
+    /// AuthenticationOk: the authentication exchange succeeded;
+    /// ParameterStatus/BackendKey/Ready events follow.
+    | Authenticated
+    | ParameterStatus { name str, value str }
+    /// The backend keys advertised by BackendKeyData; the pair a
+    /// CancelRequest frame needs ([`ClientMessage.cancel_request`]).
+    | BackendKey { process_id int, secret_key int }
+    /// ReadyForQuery; `status` is the transaction-status byte
+    /// (`I` idle, `T` in transaction, `E` failed transaction).
+    | Ready { status u8 }
+    | RowDescription { fields []RowField }
+    | DataRow { values []Option[[]u8] }
+    | CommandComplete { tag str }
+    /// EmptyQueryResponse: the query string contained only whitespace.
+    | EmptyQuery
+    /// A NoticeResponse the server interleaved; not fatal.
+    | Notice { fields []ErrorField }
+    /// An ErrorResponse mid-query. The session skips to the ReadyForQuery
+    /// that closes the cycle and recovers; the event carries the SQLSTATE
+    /// (field `C`) and the raw fields.
+    | QueryError { sqlstate str, fields []ErrorField }
+
+/// The connection state machine. Pure: feed bytes in, drain bytes out, read
+/// events off each [`Session @feed`] call. Fields are private to the
+/// exchange — observe through events and the read-only getters.
+export type Session {
+    ro user str
+    ro password str
+    ro database str
+    ro client_nonce str
+    mut phase SessionPhase
+    mut inbound []u8
+    mut outbound []u8
+    mut scram Option[ScramClient]
+    mut txn_status u8
+    mut backend_pid int
+    mut backend_key int
+    /// Simple/extended: a RowDescription (or Describe answer) was seen and
+    /// DataRow is legal now.
+    mut expect_rows bool
+    /// An ErrorResponse arrived mid-query; everything until the answering
+    /// ReadyForQuery is skipped.
+    mut in_error bool
+    mut ext_stage ExtStage
+}
+
+/// New session for `user`/`password`/`database`. The StartupMessage is
+/// already queued: drain and send it first. `client_nonce` must be unique
+/// per attempt; the consumer draws it (the pure core never touches
+/// randomness). It is only used if the server offers SCRAM-SHA-256.
+export fn Session.new(user str, password str, database str, client_nonce str) -> Session {
+    Session {
+        user,
+        password,
+        database,
+        client_nonce,
+        phase: Authenticating,
+        inbound: []u8.new(),
+        outbound: ClientMessage.startup([("user", user), ("database", database)]),
+        scram: None,
+        txn_status: 'I' as u8,
+        backend_pid: 0,
+        backend_key: 0,
+        expect_rows: false,
+        in_error: false,
+        ext_stage: ExtExecute,
+    }
+}
+
+/// Current phase.
+export fn Session @phase() -> SessionPhase =>
+    @phase
+
+/// Transaction-status byte of the last ReadyForQuery (`I`/`T`/`E`).
+export fn Session @transaction_status() -> u8 =>
+    @txn_status
+
+/// Bytes queued for the server since the last drain (or since construction).
+/// Empties the queue; the result is ready for `write_all`.
+export fn Session mut @drain() -> []u8 {
+    ro out = @outbound
+    @outbound = []u8.new()
+    out
+}
+
+/// Queue a simple-protocol query. Only legal in `Ready`; the returned
+/// error is structural, never a panic.
+export fn Session mut @query(q str) -> Result[(), PostgresError] {
+    if @phase != Ready {
+        return Err(PostgresError { kind: Protocol { what: "simple query issued while the session is not ready" } })
+    }
+    @outbound.append(ClientMessage.query(q))
+    @phase = QuerySimple
+    @expect_rows = false
+    @in_error = false
+    Ok(())
+}
+
+/// Queue an extended-protocol cycle: Parse (unnamed statement, no declared
+/// parameter types), Bind (unnamed portal, `param_formats`/`result_formats`
+/// as format codes, `None` parameter = SQL NULL), Describe portal, Execute,
+/// Sync. Only legal in `Ready`.
+export fn Session mut @query_extended(sql str, param_formats []int, params []Option[[]u8], result_formats []int) -> Result[(), PostgresError] {
+    if @phase != Ready {
+        return Err(PostgresError { kind: Protocol { what: "extended query issued while the session is not ready" } })
+    }
+    mut values []ParamValue = []ParamValue.new(cap: params.len())
+    // Index walk, not `for p in params`: iterating []Option[[]u8] with a
+    // for-loop trips a mono-collector C-build defect (repro-local/
+    // opt_slice_iter). Indexed access is not affected.
+    mut i = 0
+    while i < params.len() {
+        match params[i] {
+            Some(bytes) => values.push(ParamValue.binary(bytes))
+            None => values.push(ParamValue.null())
+        }
+        i += 1
+    }
+    @outbound.append(ClientMessage.parse("", sql, []))
+    @outbound.append(ClientMessage.bind("", "", param_formats, values, result_formats))
+    @outbound.append(ClientMessage.describe('P' as u8, ""))
+    @outbound.append(ClientMessage.execute("", 0))
+    @outbound.append(ClientMessage.sync())
+    @phase = QueryExtended
+    @ext_stage = ExtParse
+    @expect_rows = false
+    @in_error = false
+    Ok(())
+}
+
+/// Queue Terminate and move to `Closed`. A no-op on a failed session.
+export fn Session mut @close() -> () {
+    if @phase != Failed {
+        @outbound.append(ClientMessage.terminate())
+        @phase = Closed
+    }
+}
+
+/// Feed bytes arriving from the server. Decodes every complete message in
+/// the buffer, applies it to the state machine, and returns the events the
+/// application should see. A trailing incomplete frame stays buffered for
+/// the next call — the exchange survives any chunking. Structural failures
+/// (a bad frame, an illegal transition) move the session to `Failed` and
+/// return `Err`; the session is then unusable.
+export fn Session mut @feed(bytes []u8) -> Result[[]SessionEvent, PostgresError] {
+    if @phase == Closed || @phase == Failed {
+        return Err(PostgresError { kind: Protocol { what: "feed on a closed or failed session" } })
+    }
+    @inbound.append(bytes)
+    mut events []SessionEvent = []SessionEvent.new()
+    while true {
+        match ServerMessage.decode(@inbound) {
+            Ok(NeedMoreBytes) => break
+            Err(e) => {
+                @phase = Failed
+                return Err(e)
+            }
+            Ok(Message { msg, consumed }) => {
+                // Drop the consumed prefix. Rebinding @inbound to a shorter
+                // slice would not stick (D326 R6: a heap handle is passed as
+                // the handle) — mutate through truncate/append instead.
+                mut rest []u8 = []u8.new(cap: @inbound.len() - consumed)
+                rest.append(@inbound[consumed..])
+                @inbound.truncate(0)
+                @inbound.append(rest)
+                match @dispatch(msg, events) {
+                    Ok(()) => {
+                        if @phase == Failed { break }
+                    }
+                    Err(e) => {
+                        @phase = Failed
+                        return Err(e)
+                    }
+                }
+            }
+        }
+    }
+    Ok(events)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Dispatch — one arm per server message; the phase gate lives here
+// ──────────────────────────────────────────────────────────────────────────
+
+fn Session mut @dispatch(msg ServerMessage, mut events []SessionEvent) -> Result[(), PostgresError] {
+    match msg {
+        // Allowed in every phase: the server announces parameters and
+        // notices whenever it likes.
+        ParameterStatus { name, value } => events.push(SessionEvent.ParameterStatus { name, value })
+        NoticeResponse { fields } => events.push(Notice { fields })
+
+        // ErrorResponse: fatal during authentication, an event mid-query
+        // (then skip to ReadyForQuery), fatal outside any exchange.
+        // Value-position matches: `return` inside a statement-position match
+        // arm mislowers the match slot to the function's Result type and the
+        // C build fails (repro-local/match_arm_return).
+        ErrorResponse { fields } => {
+            ro r = match @phase {
+                Authenticating => Err(PostgresError { kind: Auth { what: "server rejected authentication (SQLSTATE ${sqlstate(fields)}): ${error_message(fields)}" } })
+                Startup => {
+                    events.push(QueryError { sqlstate: sqlstate(fields), fields })
+                    @phase = Failed
+                    Ok(())
+                }
+                QuerySimple | QueryExtended => {
+                    if !@in_error {
+                        @in_error = true
+                        events.push(QueryError { sqlstate: sqlstate(fields), fields })
+                    }
+                    Ok(())
+                }
+                Ready => Err(@proto("ErrorResponse while idle"))
+                Closed | Failed => Ok(())
+            }
+            r?
+        }
+
+        ReadyForQuery { status } => {
+            ro r = match @phase {
+                Authenticating => Err(@proto("ReadyForQuery during authentication"))
+                Startup => {
+                    @txn_status = status
+                    @phase = Ready
+                    events.push(Ready { status })
+                    Ok(())
+                }
+                QuerySimple | QueryExtended => {
+                    @txn_status = status
+                    @phase = Ready
+                    @expect_rows = false
+                    @in_error = false
+                    events.push(Ready { status })
+                    Ok(())
+                }
+                Ready => Err(@proto("ReadyForQuery while idle"))
+                Closed | Failed => Ok(())
+            }
+            r?
+        }
+
+        BackendKeyData { process_id, secret_key } => {
+            if @phase != Startup {
+                return Err(@proto("BackendKeyData outside the startup phase"))
+            }
+            @backend_pid = process_id
+            @backend_key = secret_key
+            events.push(BackendKey { process_id, secret_key })
+        }
+
+        AuthenticationOk => {
+            if @phase != Authenticating {
+                return Err(@proto("AuthenticationOk outside the authentication phase"))
+            }
+            @phase = Startup
+            events.push(Authenticated)
+        }
+        AuthenticationCleartextPassword => {
+            if @phase != Authenticating {
+                return Err(@proto("cleartext password request outside the authentication phase"))
+            }
+            @outbound.append(ClientMessage.password(@password))
+        }
+        AuthenticationMd5Password { salt } => {
+            if @phase != Authenticating {
+                return Err(@proto("MD5 password request outside the authentication phase"))
+            }
+            @outbound.append(ClientMessage.password(md5_response(@user, @password, salt)))
+        }
+        AuthenticationSasl { mechanisms } => {
+            if @phase != Authenticating {
+                return Err(@proto("SASL request outside the authentication phase"))
+            }
+            mut offered = false
+            for m in mechanisms {
+                if m == "SCRAM-SHA-256" {
+                    offered = true
+                }
+            }
+            if !offered {
+                return Err(PostgresError { kind: Auth { what: "server offers no SCRAM-SHA-256" } })
+            }
+            mut client = ScramClient.new(@user, @password, @client_nonce)
+            @outbound.append(ClientMessage.sasl_initial("SCRAM-SHA-256", client.client_first().bytes()))
+            @scram = Some(client)
+        }
+        AuthenticationSaslContinue { data } => {
+            if @phase != Authenticating {
+                return Err(@proto("SASL challenge outside the authentication phase"))
+            }
+            mut client = match @scram {
+                Some(c) => c
+                None => return Err(@proto("SASL challenge before the mechanism started"))
+            }
+            ro server_first = match data.to_str() {
+                Ok(s) => s
+                Err(_) => return Err(PostgresError { kind: Auth { what: "SASL challenge is not UTF-8" } })
+            }
+            ro client_final = client.respond_server_first(server_first)?
+            @scram = Some(client)
+            @outbound.append(ClientMessage.sasl_response(client_final.bytes()))
+        }
+        AuthenticationSaslFinal { data } => {
+            if @phase != Authenticating {
+                return Err(@proto("SASL final outside the authentication phase"))
+            }
+            mut client = match @scram {
+                Some(c) => c
+                None => return Err(@proto("SASL final before the mechanism started"))
+            }
+            ro server_final = match data.to_str() {
+                Ok(s) => s
+                Err(_) => return Err(PostgresError { kind: Auth { what: "SASL final is not UTF-8" } })
+            }
+            ro r = client.verify_server_final(server_final)
+            @scram = Some(client)
+            r?
+        }
+
+        // Everything below is query progress; during error-skip it is
+        // ignored until the ReadyForQuery arm above closes the cycle.
+        RowDescription { fields } => {
+            if @in_error { return Ok(()) }
+            match @phase {
+                QuerySimple => {
+                    @expect_rows = true
+                    events.push(RowDescription { fields })
+                }
+                QueryExtended => {
+                    if @ext_stage != ExtDescribe {
+                        return Err(@proto("RowDescription out of order in the extended cycle"))
+                    }
+                    @ext_stage = ExtExecute
+                    @expect_rows = true
+                    events.push(RowDescription { fields })
+                }
+                _ => return Err(@proto("RowDescription outside a query"))
+            }
+        }
+        DataRow { values } => {
+            if @in_error { return Ok(()) }
+            ro allowed = match @phase {
+                QuerySimple => @expect_rows
+                QueryExtended => @ext_stage == ExtExecute && @expect_rows
+                _ => return Err(@proto("DataRow outside a query"))
+            }
+            if !allowed {
+                return Err(@proto("DataRow before RowDescription"))
+            }
+            events.push(DataRow { values: raw_values(values) })
+        }
+        CommandComplete { tag } => {
+            if @in_error { return Ok(()) }
+            match @phase {
+                QuerySimple => events.push(CommandComplete { tag })
+                QueryExtended => {
+                    if @ext_stage != ExtExecute {
+                        return Err(@proto("CommandComplete out of order in the extended cycle"))
+                    }
+                    events.push(CommandComplete { tag })
+                }
+                _ => return Err(@proto("CommandComplete outside a query"))
+            }
+        }
+        EmptyQueryResponse => {
+            if @in_error { return Ok(()) }
+            match @phase {
+                QuerySimple => events.push(EmptyQuery)
+                QueryExtended => {
+                    if @ext_stage != ExtExecute {
+                        return Err(@proto("EmptyQueryResponse out of order in the extended cycle"))
+                    }
+                    events.push(EmptyQuery)
+                }
+                _ => return Err(@proto("EmptyQueryResponse outside a query"))
+            }
+        }
+        ParseComplete => {
+            if @in_error { return Ok(()) }
+            if @phase != QueryExtended || @ext_stage != ExtParse {
+                return Err(@proto("ParseComplete outside the extended parse step"))
+            }
+            @ext_stage = ExtBind
+        }
+        BindComplete => {
+            if @in_error { return Ok(()) }
+            if @phase != QueryExtended || @ext_stage != ExtBind {
+                return Err(@proto("BindComplete outside the extended bind step"))
+            }
+            @ext_stage = ExtDescribe
+        }
+        NoData => {
+            if @in_error { return Ok(()) }
+            if @phase != QueryExtended || @ext_stage != ExtDescribe {
+                return Err(@proto("NoData outside the extended describe step"))
+            }
+            @ext_stage = ExtExecute
+        }
+    }
+    // Not the tail expression on purpose: a trailing `match` in a function
+    // returning Result gets its slot mis-typed to Result at the C-codegen
+    // stage (repro-local/match_arm_return). The explicit tail keeps the
+    // match in statement position.
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Small helpers
+// ──────────────────────────────────────────────────────────────────────────
+
+// Short constructor for the Protocol error kind, used at every gate above.
+fn Session @proto(what str) -> PostgresError =>
+    { kind: Protocol { what } }
+
+// SQLSTATE code (ErrorResponse field `C`), empty when the server omitted it.
+fn sqlstate(fields []ErrorField) -> str {
+    for f in fields {
+        if f.code == 'C' as u8 {
+            return f.value
+        }
+    }
+    ""
+}
+
+// Human message (ErrorResponse field `M`), empty when omitted.
+fn error_message(fields []ErrorField) -> str {
+    for f in fields {
+        if f.code == 'M' as u8 {
+            return f.value
+        }
+    }
+    ""
+}
+
+// Decode.nv delivers rows as []ParamValue (the Bind-side type); events
+// expose the raw shape. The `None` arm binds through a typed local on
+// purpose: a bare `None` literal pushed into []Option[[]u8] instantiates
+// as Option[int] at the C-codegen stage (repro-local/none_slice_lower).
+fn raw_values(values []ParamValue) -> []Option[[]u8] {
+    mut out []Option[[]u8] = []Option[[]u8].new(cap: values.len())
+    for v in values {
+        match v.data {
+            Some(bytes) => out.push(Some(bytes))
+            None => {
+                ro n Option[[]u8] = None
+                out.push(n)
+            }
+        }
+    }
+    out
+}
