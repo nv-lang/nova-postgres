@@ -12,6 +12,8 @@
 
 module postgres
 
+import std.runtime.read_buffer.{ReadBuffer}
+
 // Protocol maximum for a single message length field (1 GiB).
 const MAX_MESSAGE_LEN = 1 << 30
 
@@ -81,11 +83,16 @@ export type DecodeOutcome enum
 export fn ServerMessage.decode(bytes []u8) -> Result[DecodeOutcome, PostgresError] {
     if bytes.len() < 5 { return Ok(NeedMoreBytes) }
     ro tag = bytes[0]
-    ro len = be_u32(bytes, 1)
+    // The header is complete (checked above); a read failure here is
+    // unreachable, and «need more bytes» is the honest answer anyway.
+    ro len = match ReadBuffer.from(bytes[1..]).read_u32_be() {
+        Ok(v) => v as int
+        Err(_) => return Ok(NeedMoreBytes)
+    }
     if len < 4 { return Err(PostgresError { kind: BadLength { len } }) }
     if len > MAX_MESSAGE_LEN { return Err(PostgresError { kind: LengthOverflow { len } }) }
     if bytes.len() < 1 + len { return Ok(NeedMoreBytes) }
-    mut cur = ByteCursor.new(bytes[5..1 + len])
+    mut cur = ReadBuffer.from(bytes[5..1 + len])
     ro msg = decode_payload(tag, cur)?
     Ok(Message { msg, consumed: 1 + len })
 }
@@ -111,7 +118,7 @@ export fn ServerMessage.decode_all(bytes []u8) -> Result[[]ServerMessage, Postgr
 // Payload dispatch — one arm per documented message layout
 // ──────────────────────────────────────────────────────────────────────────
 
-fn decode_payload(tag u8, mut cur ByteCursor) -> Result[ServerMessage, PostgresError] {
+fn decode_payload(tag u8, mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
     if tag == 'R' as u8 { return decode_auth(cur) }
     if tag == 'S' as u8 { return decode_parameter_status(cur) }
     if tag == 'K' as u8 { return decode_backend_key_data(cur) }
@@ -148,7 +155,7 @@ fn decode_payload(tag u8, mut cur ByteCursor) -> Result[ServerMessage, PostgresE
 }
 
 // Authentication family: int32 code picks the variant.
-fn decode_auth(mut cur ByteCursor) -> Result[ServerMessage, PostgresError] {
+fn decode_auth(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
     ro code = need_u32(cur, "authentication code")?
     if code == 0 {
         finish(cur, "AuthenticationOk")?
@@ -185,23 +192,23 @@ fn decode_auth(mut cur ByteCursor) -> Result[ServerMessage, PostgresError] {
         ro data = need_rest(cur, "SASLFinal data")?
         return Ok(AuthenticationSaslFinal { data })
     }
-    Err(PostgresError { kind: Auth { what: "unsupported authentication request code ${code.to_str()}" } })
+    Err(PostgresError { kind: Auth { what: "unsupported authentication request code ${code}" } })
 }
 
-fn decode_parameter_status(mut cur ByteCursor) -> Result[ServerMessage, PostgresError] {
+fn decode_parameter_status(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
     ro name = need_cstr(cur, "ParameterStatus name")?
     ro value = need_cstr(cur, "ParameterStatus value")?
     finish(cur, "ParameterStatus")?
     Ok(ParameterStatus { name, value })
 }
 
-fn decode_backend_key_data(mut cur ByteCursor) -> Result[ServerMessage, PostgresError] {
+fn decode_backend_key_data(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
     ro pid = need_u32(cur, "BackendKeyData process id")?
     ro key = need_u32(cur, "BackendKeyData secret key")?
     Ok(BackendKeyData { process_id: pid, secret_key: key })
 }
 
-fn decode_row_description(mut cur ByteCursor) -> Result[ServerMessage, PostgresError] {
+fn decode_row_description(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
     ro count = need_u16(cur, "RowDescription field count")?
     mut fields []RowField = []RowField.new(cap: count)
     for _ in 0..count {
@@ -226,7 +233,7 @@ fn decode_row_description(mut cur ByteCursor) -> Result[ServerMessage, PostgresE
     Ok(RowDescription { fields })
 }
 
-fn decode_data_row(mut cur ByteCursor) -> Result[ServerMessage, PostgresError] {
+fn decode_data_row(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
     ro count = need_u16(cur, "DataRow column count")?
     mut values []ParamValue = []ParamValue.new(cap: count)
     for _ in 0..count {
@@ -246,7 +253,7 @@ fn decode_data_row(mut cur ByteCursor) -> Result[ServerMessage, PostgresError] {
 
 // ErrorResponse ('E') and NoticeResponse ('N') share the field layout:
 // repeated (code byte, cstring value) pairs, terminated by a zero code byte.
-fn decode_error_fields(mut cur ByteCursor, notice bool) -> Result[ServerMessage, PostgresError] {
+fn decode_error_fields(mut cur ReadBuffer, notice bool) -> Result[ServerMessage, PostgresError] {
     mut fields []ErrorField = []ErrorField.new()
     while true {
         ro code = need_u8(cur, "error/notice field code")?
@@ -263,60 +270,71 @@ fn decode_error_fields(mut cur ByteCursor, notice bool) -> Result[ServerMessage,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Cursor reads that fail as structured errors, never panics
+// ReadBuffer reads that fail as structured errors, never panics
 // ──────────────────────────────────────────────────────────────────────────
 
-fn need_u8(mut cur ByteCursor, what str) -> Result[u8, PostgresError] {
+fn need_u8(mut cur ReadBuffer, what str) -> Result[u8, PostgresError] {
     match cur.read_u8() {
-        Some(v) => Ok(v)
-        None => Err(PostgresError { kind: Truncated { what } })
+        Ok(v) => Ok(v)
+        Err(_) => Err(PostgresError { kind: Truncated { what } })
     }
 }
 
-fn need_u16(mut cur ByteCursor, what str) -> Result[int, PostgresError] {
-    match cur.read_be_u16() {
-        Some(v) => Ok(v)
-        None => Err(PostgresError { kind: Truncated { what } })
+fn need_u16(mut cur ReadBuffer, what str) -> Result[int, PostgresError] {
+    match cur.read_u16_be() {
+        Ok(v) => Ok(v as int)
+        Err(_) => Err(PostgresError { kind: Truncated { what } })
     }
 }
 
-fn need_u32(mut cur ByteCursor, what str) -> Result[int, PostgresError] {
-    match cur.read_be_u32() {
-        Some(v) => Ok(v)
-        None => Err(PostgresError { kind: Truncated { what } })
+fn need_u32(mut cur ReadBuffer, what str) -> Result[int, PostgresError] {
+    match cur.read_u32_be() {
+        Ok(v) => Ok(v as int)
+        Err(_) => Err(PostgresError { kind: Truncated { what } })
     }
 }
 
-fn need_i32(mut cur ByteCursor, what str) -> Result[int, PostgresError] {
-    match cur.read_be_i32() {
-        Some(v) => Ok(v)
-        None => Err(PostgresError { kind: Truncated { what } })
+fn need_i32(mut cur ReadBuffer, what str) -> Result[int, PostgresError] {
+    match cur.read_i32_be() {
+        Ok(v) => Ok(v as int)
+        Err(_) => Err(PostgresError { kind: Truncated { what } })
     }
 }
 
-fn need_cstr(mut cur ByteCursor, what str) -> Result[str, PostgresError] {
-    match cur.read_cstr() {
-        Some(s) => Ok(s)
-        None => Err(PostgresError { kind: Truncated { what } })
+// NUL-terminated string (protocol cstring). std ReadBuffer has no cstring
+// read; this walks bytes to the terminator. Unterminated or non-UTF-8 input
+// is a Truncated error, matching the rest of the need_* family.
+fn need_cstr(mut cur ReadBuffer, what str) -> Result[str, PostgresError] {
+    mut acc []u8 = []u8.new()
+    while true {
+        match cur.read_u8() {
+            Ok(0) => break
+            Ok(b) => acc.push(b)
+            Err(_) => return Err(PostgresError { kind: Truncated { what } })
+        }
+    }
+    match acc.to_str() {
+        Ok(s) => Ok(s)
+        Err(_) => Err(PostgresError { kind: Truncated { what } })
     }
 }
 
-fn need_bytes(mut cur ByteCursor, n int, what str) -> Result[[]u8, PostgresError] {
+fn need_bytes(mut cur ReadBuffer, n int, what str) -> Result[[]u8, PostgresError] {
     match cur.read_bytes(n) {
-        Some(b) => Ok(b)
-        None => Err(PostgresError { kind: Truncated { what } })
+        Ok(b) => Ok(b)
+        Err(_) => Err(PostgresError { kind: Truncated { what } })
     }
 }
 
-fn need_rest(mut cur ByteCursor, what str) -> Result[[]u8, PostgresError] {
-    need_bytes(cur, cur.remaining(), what)
+fn need_rest(mut cur ReadBuffer, what str) -> Result[[]u8, PostgresError] {
+    Ok(cur.remaining_bytes())
 }
 
 // Payload must end exactly where the documented layout ends.
-fn finish(cur ByteCursor, what str) -> Result[(), PostgresError] {
-    if cur.is_empty() {
-        Ok(())
-    } else {
+fn finish(cur ReadBuffer, what str) -> Result[(), PostgresError] {
+    if cur.has_remaining(1) {
         Err(PostgresError { kind: Malformed { what } })
+    } else {
+        Ok(())
     }
 }

@@ -17,6 +17,7 @@ module postgres
 import std.crypto.sha256.{Sha256}
 import std.crypto.hmac.{HmacSha256}
 import std.encoding.base64.{Base64}
+import std.runtime.write_buffer.{WriteBuffer}
 
 // SCRAM channel binding data for PostgreSQL: base64("n,,") — no channel
 // binding, no authzid. Constant per RFC 5802.
@@ -144,7 +145,7 @@ fn scram_escape(s str) -> str {
 // Value of the `key` attribute in a comma-separated SCRAM attribute list.
 // Absent key or missing '=' is an Auth error, never a panic.
 fn scram_attribute(message str, key str) -> Result[str, PostgresError] {
-    for part in message.split(",").collect() {
+    for part in message.split(",") {
         match part.split_once("=") {
             Some((k, v)) => {
                 if k == key {
@@ -161,10 +162,10 @@ fn scram_attribute(message str, key str) -> Result[str, PostgresError] {
 // U1 = HMAC(pw, salt || INT32BE(1)); Ui = HMAC(pw, U(i-1));
 // result = U1 ^ U2 ^ ... ^ Uc. Iteration counts here are the full c.
 fn pbkdf2_hmac_sha256(password []u8, salt []u8, iterations int) -> [32]u8 {
-    mut block []u8 = []u8.new(cap: salt.len() + 4)
-    block.append(salt)
-    push_be_u32(block, 1)
-    mut u = HmacSha256.compute(password, block)
+    mut block = WriteBuffer.new(cap: salt.len() + 4)
+    block.write_bytes(salt)
+    block.write_u32_be(1)
+    mut u = HmacSha256.compute(password, block.into_bytes())
     mut result = u
     mut i = 1
     while i < iterations {

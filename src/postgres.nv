@@ -6,10 +6,11 @@
 //
 // This is the PostgreSQL frontend/backend wire protocol (version 3.0) as pure
 // functions — sans-I/O. The package never opens a socket; the caller moves
-// bytes. Peer files and their roles:
+// bytes. Buffering is std ReadBuffer/WriteBuffer (runtime.read_buffer,
+// runtime.write_buffer); only the NUL-terminated string (cstring) helpers are
+// local to encode/decode — std has none. Peer files and their roles:
 //
 //   error.nv    — `PostgresError`: one structural error domain for the package
-//   bytes.nv    — private big-endian/little-endian byte helpers (no panics)
 //   encode.nv   — client messages: message -> bytes
 //   decode.nv   — server messages: bytes -> message, incremental (need-more-bytes)
 //   scram.nv    — SCRAM-SHA-256 client (RFC 5802 / RFC 7677) as pure state steps
