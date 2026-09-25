@@ -12,8 +12,14 @@
 module postgres
 
 // error mid simple query and recovery on ReadyForQuery
-fn recovery_server() -> []u8 =>
-    cat3(row_desc("a"), error_response("42601", "syntax error"), ready('I' as u8))
+fn recovery_server() -> []u8 {
+    // A row the server had already queued behind the error: the session
+    // must skip it together with everything up to ReadyForQuery. Without
+    // the skip it would surface as a DataRow event and fail the reference
+    // transcript — that is what §Д8б probe 1 breaks on purpose.
+    ro after_error = cat(data_row_text("5"), ready('I' as u8))
+    cat3(row_desc("a"), error_response("42601", "syntax error"), after_error)
+}
 
 test "criterion 2: error mid simple query and recovery" {
     consume s = Session.new("postgres", "smoke", "postgres", "n")
