@@ -1,0 +1,11 @@
+# nova.toml — nova-postgres example: the §Д8б criterion-5 live run against a
+# throwaway PostgreSQL in Docker on a Docker-chosen free port. Mini-package
+# depending on the parent package (and its pgnet module) by path.
+
+[package]
+name = "postgres-example-live"
+version = "0.1.0"
+description = "Live §Д8б run: SCRAM, SELECT 1, 10000 rows, error recovery, extended query, NULL, transaction status"
+
+[dependencies]
+postgres = { path = "../.." }

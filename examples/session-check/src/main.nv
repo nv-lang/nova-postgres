@@ -13,7 +13,7 @@ module main
 
 import std.runtime.write_buffer.{WriteBuffer}
 
-import postgres.{Session, SessionPhase, PgEvent, ParamValue, PostgresError, Protocol, ClientMessage, ErrorField, Authenticated, Parameter, BackendKey, Ready, RowDesc, Row, Command, EmptyQuery, Notice, QueryError}
+import postgres.{Session, SessionPhase, PgEvent, ParamValue, PostgresError, Protocol, ClientMessage, ErrorField, Authenticated, Parameter, BackendKey, Ready, RowDesc, Row, Complete, EmptyQuery, Notice, QueryError}
 
 // Local framing (the package's frame() is private): tag + big-endian length
 // + payload, per «Message Formats».
@@ -192,7 +192,7 @@ fn ev(e PgEvent) -> str =>
         Ready { status } => "ready:${(status as int).to_char() ?? '?'}"
         RowDesc { fields } => "rowdesc:${fields.len()}:${fields[0].name}:${fields[0].format}"
         Row { values } => row_render(values)
-        Command { tag } => "cc:${tag}"
+        Complete { tag } => "cc:${tag}"
         EmptyQuery => "empty"
         Notice { fields } => "notice:${error_message(fields)}"
         QueryError { sqlstate, fields } => "error:${sqlstate}:${error_message(fields)}"

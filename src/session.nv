@@ -57,7 +57,7 @@ export type PgEvent enum
     | Ready { status u8 }
     | RowDesc { fields []RowField }
     | Row { values []ParamValue }
-    | Command { tag str }
+    | Complete { tag str }
     /// EmptyQueryResponse: the query string contained only whitespace.
     | EmptyQuery
     /// A NoticeResponse the server interleaved; not fatal.
@@ -255,11 +255,11 @@ fn Session mut @dispatch(msg ServerMessage, mut events []PgEvent) -> Result[(), 
         // Allowed in every phase: the server announces parameters and
         // notices whenever it likes.
         ParameterStatus { name, value } => {
-            events.push(Parameter { name, value })
+            events.push(PgEvent.Parameter { name, value })
             Ok(())
         }
         NoticeResponse { fields } => {
-            events.push(Notice { fields })
+            events.push(PgEvent.Notice { fields })
             Ok(())
         }
 
@@ -271,14 +271,14 @@ fn Session mut @dispatch(msg ServerMessage, mut events []PgEvent) -> Result[(), 
         ErrorResponse { fields } => match @phase {
             Authenticating => Err(PostgresError { kind: Auth { what: "server rejected authentication (SQLSTATE ${sqlstate(fields)}): ${error_message(fields)}" } })
             Startup => {
-                events.push(QueryError { sqlstate: sqlstate(fields), fields })
+                events.push(PgEvent.QueryError { sqlstate: sqlstate(fields), fields })
                 @phase = Failed
                 Ok(())
             }
             QuerySimple | QueryExtended => {
                 if !@in_error {
                     @in_error = true
-                    events.push(QueryError { sqlstate: sqlstate(fields), fields })
+                    events.push(PgEvent.QueryError { sqlstate: sqlstate(fields), fields })
                 }
                 Ok(())
             }
@@ -291,7 +291,7 @@ fn Session mut @dispatch(msg ServerMessage, mut events []PgEvent) -> Result[(), 
             Startup => {
                 @txn_status = status
                 @phase = Ready
-                events.push(Ready { status })
+                events.push(PgEvent.Ready { status })
                 Ok(())
             }
             QuerySimple | QueryExtended => {
@@ -299,7 +299,7 @@ fn Session mut @dispatch(msg ServerMessage, mut events []PgEvent) -> Result[(), 
                 @phase = Ready
                 @expect_rows = false
                 @in_error = false
-                events.push(Ready { status })
+                events.push(PgEvent.Ready { status })
                 Ok(())
             }
             Ready => Err(@proto("ReadyForQuery while idle"))
@@ -312,7 +312,7 @@ fn Session mut @dispatch(msg ServerMessage, mut events []PgEvent) -> Result[(), 
             }
             @backend_pid = process_id
             @backend_key = secret_key
-            events.push(BackendKey { process_id, secret_key })
+            events.push(PgEvent.BackendKey { process_id, secret_key })
             Ok(())
         }
 
@@ -321,7 +321,7 @@ fn Session mut @dispatch(msg ServerMessage, mut events []PgEvent) -> Result[(), 
                 return Err(@proto("AuthenticationOk outside the authentication phase"))
             }
             @phase = Startup
-            events.push(Authenticated)
+            events.push(PgEvent.Authenticated)
             Ok(())
         }
         AuthenticationCleartextPassword => {
@@ -419,7 +419,7 @@ fn Session mut @dispatch_query(msg ServerMessage, mut events []PgEvent) -> Resul
                 return Err(@proto("RowDescription outside a query"))
             }
             @expect_rows = true
-            events.push(RowDesc { fields: row_fields_of(msg) })
+            events.push(PgEvent.RowDesc { fields: row_fields_of(msg) })
             Ok(())
         }
         DataRow { .. } => {
@@ -435,7 +435,7 @@ fn Session mut @dispatch_query(msg ServerMessage, mut events []PgEvent) -> Resul
             if !allowed {
                 return Err(@proto("DataRow before RowDescription"))
             }
-            events.push(Row { values: row_values_of(msg) })
+            events.push(PgEvent.Row { values: row_values_of(msg) })
             Ok(())
         }
         CommandComplete { .. } => {
@@ -447,7 +447,7 @@ fn Session mut @dispatch_query(msg ServerMessage, mut events []PgEvent) -> Resul
             } else if @phase != QuerySimple {
                 return Err(@proto("CommandComplete outside a query"))
             }
-            events.push(Command { tag: command_tag_of(msg) })
+            events.push(Complete { tag: command_tag_of(msg) })
             Ok(())
         }
         EmptyQueryResponse => {
@@ -459,7 +459,7 @@ fn Session mut @dispatch_query(msg ServerMessage, mut events []PgEvent) -> Resul
             } else if @phase != QuerySimple {
                 return Err(@proto("EmptyQueryResponse outside a query"))
             }
-            events.push(EmptyQuery)
+            events.push(PgEvent.EmptyQuery)
             Ok(())
         }
         ParseComplete => {
@@ -545,7 +545,7 @@ export type Event2 enum
     | Ready { status u8 }
     | RowDesc { fields []RowField }
     | Row { values []ParamValue }
-    | Command { tag str }
+    | Complete { tag str }
     | EmptyQuery
     | Notice { fields []ErrorField }
     | QueryError { sqlstate str, fields []ErrorField }
