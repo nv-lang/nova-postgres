@@ -82,19 +82,25 @@ export type DecodeOutcome enum
 /// frame yields `Err(PostgresError)` — never a panic.
 export fn ServerMessage.decode(bytes []u8) -> Result[DecodeOutcome, PostgresError] {
     if bytes.len() < 5 { return Ok(NeedMoreBytes) }
-    ro tag = bytes[0]
-    // The header is complete (checked above); a read failure here is
-    // unreachable, and «need more bytes» is the honest answer anyway.
-    ro len = match ReadBuffer.from(bytes[1..]).read_u32_be() {
+    // One cursor for the whole frame — header and payload read from the
+    // same ReadBuffer. `end` is the frame's absolute end offset (1 + len);
+    // the payload readers must land exactly on it (finish checks), which
+    // keeps them from over-reading into a following frame.
+    mut cur = ReadBuffer.from(bytes)
+    ro tag = match cur.read_u8() {
+        Ok(v) => v
+        Err(_) => return Ok(NeedMoreBytes)
+    }
+    ro len = match cur.read_u32_be() {
         Ok(v) => v as int
         Err(_) => return Ok(NeedMoreBytes)
     }
     if len < 4 { return Err(PostgresError { kind: BadLength { len } }) }
     if len > MAX_MESSAGE_LEN { return Err(PostgresError { kind: LengthOverflow { len } }) }
     if bytes.len() < 1 + len { return Ok(NeedMoreBytes) }
-    mut cur = ReadBuffer.from(bytes[5..1 + len])
-    ro msg = decode_payload(tag, cur)?
-    Ok(Message { msg, consumed: 1 + len })
+    ro end = 1 + len
+    ro msg = decode_payload(tag, cur, end)?
+    Ok(Message { msg, consumed: end })
 }
 
 /// Decode every complete message in `bytes`, stopping quietly at a trailing
@@ -118,56 +124,56 @@ export fn ServerMessage.decode_all(bytes []u8) -> Result[[]ServerMessage, Postgr
 // Payload dispatch — one arm per documented message layout
 // ──────────────────────────────────────────────────────────────────────────
 
-fn decode_payload(tag u8, mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
-    if tag == 'R' as u8 { return decode_auth(cur) }
-    if tag == 'S' as u8 { return decode_parameter_status(cur) }
-    if tag == 'K' as u8 { return decode_backend_key_data(cur) }
+fn decode_payload(tag u8, mut cur ReadBuffer, end int) -> Result[ServerMessage, PostgresError] {
+    if tag == 'R' as u8 { return decode_auth(cur, end) }
+    if tag == 'S' as u8 { return decode_parameter_status(cur, end) }
+    if tag == 'K' as u8 { return decode_backend_key_data(cur, end) }
     if tag == 'Z' as u8 {
         ro status = need_u8(cur, "ReadyForQuery status")?
         return Ok(ReadyForQuery { status })
     }
-    if tag == 'T' as u8 { return decode_row_description(cur) }
-    if tag == 'D' as u8 { return decode_data_row(cur) }
+    if tag == 'T' as u8 { return decode_row_description(cur, end) }
+    if tag == 'D' as u8 { return decode_data_row(cur, end) }
     if tag == 'C' as u8 {
         ro cmd_tag = cur.read_cstr("CommandComplete tag")?
-        finish(cur, "CommandComplete")?
+        finish(cur, end, "CommandComplete")?
         return Ok(CommandComplete { tag: cmd_tag })
     }
-    if tag == 'E' as u8 { return decode_error_fields(cur, false) }
-    if tag == 'N' as u8 { return decode_error_fields(cur, true) }
+    if tag == 'E' as u8 { return decode_error_fields(cur, end, false) }
+    if tag == 'N' as u8 { return decode_error_fields(cur, end, true) }
     if tag == '1' as u8 {
-        finish(cur, "ParseComplete")?
+        finish(cur, end, "ParseComplete")?
         return Ok(ParseComplete)
     }
     if tag == '2' as u8 {
-        finish(cur, "BindComplete")?
+        finish(cur, end, "BindComplete")?
         return Ok(BindComplete)
     }
     if tag == 'n' as u8 {
-        finish(cur, "NoData")?
+        finish(cur, end, "NoData")?
         return Ok(NoData)
     }
     if tag == 'I' as u8 {
-        finish(cur, "EmptyQueryResponse")?
+        finish(cur, end, "EmptyQueryResponse")?
         return Ok(EmptyQueryResponse)
     }
     Err(PostgresError { kind: UnknownTag { tag } })
 }
 
 // Authentication family: int32 code picks the variant.
-fn decode_auth(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
+fn decode_auth(mut cur ReadBuffer, end int) -> Result[ServerMessage, PostgresError] {
     ro code = need_u32(cur, "authentication code")?
     if code == 0 {
-        finish(cur, "AuthenticationOk")?
+        finish(cur, end, "AuthenticationOk")?
         return Ok(AuthenticationOk)
     }
     if code == 3 {
-        finish(cur, "AuthenticationCleartextPassword")?
+        finish(cur, end, "AuthenticationCleartextPassword")?
         return Ok(AuthenticationCleartextPassword)
     }
     if code == 5 {
         ro salt = need_bytes(cur, 4, "MD5 salt")?
-        finish(cur, "AuthenticationMd5Password")?
+        finish(cur, end, "AuthenticationMd5Password")?
         ro arr [4]u8 = [salt[0], salt[1], salt[2], salt[3]]
         return Ok(AuthenticationMd5Password { salt: arr })
     }
@@ -185,30 +191,30 @@ fn decode_auth(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
         return Ok(AuthenticationSasl { mechanisms: mechs })
     }
     if code == 11 {
-        ro data = need_rest(cur, "SASLContinue data")?
+        ro data = need_rest(cur, end, "SASLContinue data")?
         return Ok(AuthenticationSaslContinue { data })
     }
     if code == 12 {
-        ro data = need_rest(cur, "SASLFinal data")?
+        ro data = need_rest(cur, end, "SASLFinal data")?
         return Ok(AuthenticationSaslFinal { data })
     }
     Err(PostgresError { kind: Auth { what: "unsupported authentication request code ${code}" } })
 }
 
-fn decode_parameter_status(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
+fn decode_parameter_status(mut cur ReadBuffer, end int) -> Result[ServerMessage, PostgresError] {
     ro name = cur.read_cstr("ParameterStatus name")?
     ro value = cur.read_cstr("ParameterStatus value")?
-    finish(cur, "ParameterStatus")?
+    finish(cur, end, "ParameterStatus")?
     Ok(ParameterStatus { name, value })
 }
 
-fn decode_backend_key_data(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
+fn decode_backend_key_data(mut cur ReadBuffer, end int) -> Result[ServerMessage, PostgresError] {
     ro pid = need_u32(cur, "BackendKeyData process id")?
     ro key = need_u32(cur, "BackendKeyData secret key")?
     Ok(BackendKeyData { process_id: pid, secret_key: key })
 }
 
-fn decode_row_description(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
+fn decode_row_description(mut cur ReadBuffer, end int) -> Result[ServerMessage, PostgresError] {
     ro count = need_u16(cur, "RowDescription field count")?
     mut fields []RowField = []RowField.new(cap: count)
     for _ in 0..count {
@@ -229,11 +235,11 @@ fn decode_row_description(mut cur ReadBuffer) -> Result[ServerMessage, PostgresE
             format,
         })
     }
-    finish(cur, "RowDescription")?
+    finish(cur, end, "RowDescription")?
     Ok(RowDescription { fields })
 }
 
-fn decode_data_row(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
+fn decode_data_row(mut cur ReadBuffer, end int) -> Result[ServerMessage, PostgresError] {
     ro count = need_u16(cur, "DataRow column count")?
     mut values []ParamValue = []ParamValue.new(cap: count)
     for _ in 0..count {
@@ -247,13 +253,13 @@ fn decode_data_row(mut cur ReadBuffer) -> Result[ServerMessage, PostgresError] {
             values.push(ParamValue.binary(bytes))
         }
     }
-    finish(cur, "DataRow")?
+    finish(cur, end, "DataRow")?
     Ok(DataRow { values })
 }
 
 // ErrorResponse ('E') and NoticeResponse ('N') share the field layout:
 // repeated (code byte, cstring value) pairs, terminated by a zero code byte.
-fn decode_error_fields(mut cur ReadBuffer, notice bool) -> Result[ServerMessage, PostgresError] {
+fn decode_error_fields(mut cur ReadBuffer, end int, notice bool) -> Result[ServerMessage, PostgresError] {
     mut fields []ErrorField = []ErrorField.new()
     while true {
         ro code = need_u8(cur, "error/notice field code")?
@@ -261,7 +267,7 @@ fn decode_error_fields(mut cur ReadBuffer, notice bool) -> Result[ServerMessage,
         ro value = cur.read_cstr("error/notice field value")?
         fields.push(ErrorField { code, value })
     }
-    finish(cur, "ErrorResponse/NoticeResponse")?
+    finish(cur, end, "ErrorResponse/NoticeResponse")?
     if notice {
         Ok(NoticeResponse { fields })
     } else {
@@ -326,13 +332,18 @@ fn need_bytes(mut cur ReadBuffer, n int, what str) -> Result[[]u8, PostgresError
     }
 }
 
-fn need_rest(mut cur ReadBuffer, what str) -> Result[[]u8, PostgresError] {
-    Ok(cur.remaining_bytes())
+fn need_rest(mut cur ReadBuffer, end int, what str) -> Result[[]u8, PostgresError] {
+    need_bytes(cur, end - cur.position(), what)
 }
 
-// Payload must end exactly where the documented layout ends.
-fn finish(cur ReadBuffer, what str) -> Result[(), PostgresError] {
-    if cur.has_remaining(1) {
+// Payload must end exactly at the frame end `end` (the absolute offset
+// 1 + len). Reading PAST it means the layout outran the declared length
+// (Truncated — the slice-bounded cursor used to fail the read); landing
+// BEFORE it means bytes the documented layout does not consume (Malformed).
+fn finish(cur ReadBuffer, end int, what str) -> Result[(), PostgresError] {
+    if cur.position() > end {
+        Err(PostgresError { kind: Truncated { what } })
+    } else if cur.position() < end {
         Err(PostgresError { kind: Malformed { what } })
     } else {
         Ok(())
