@@ -1,0 +1,30 @@
+// src/postgres/ssl.nv — the SSLRequest negotiation as a PURE step (plan 286
+// §Д8в criterion 2). The adapter sends [`ClientMessage.ssl_request`] and reads
+// exactly one answer byte; this module classifies that byte. No socket, no
+// TLS types — the pure core keeps depending on std only (the TlsMode that
+// carries nova-tls's VerificationMode lives in the pgnet adapter).
+
+module postgres
+
+/// The server's single-byte answer to SSLRequest, per «Message Flow» →
+/// «SSL Session Encryption»: `S` — TLS is supported on this socket, `N` —
+/// it is not.
+export type SslAnswer enum
+    /// 'S' — switch this socket to TLS.
+    | TlsSupported
+    /// 'N' — continue in plaintext.
+    | TlsRefused
+
+/// Classify the server's answer byte after SSLRequest. ANY byte other than
+/// `S`/`N` — including `E` (an old server answering with an ErrorResponse,
+/// whose tag byte arrives in place of the answer) — is a structured
+/// `PostgresErrorKind.Protocol`, never a guess. Pure; tests feed bytes.
+export fn SslAnswer.classify(byte u8) -> Result[SslAnswer, PostgresError] {
+    if byte == 'S' as u8 {
+        return Ok(TlsSupported)
+    }
+    if byte == 'N' as u8 {
+        return Ok(TlsRefused)
+    }
+    Err(PostgresError { kind: Protocol { what: "expected 'S' or 'N' as the SSLRequest answer, got byte ${byte as int}" } })
+}

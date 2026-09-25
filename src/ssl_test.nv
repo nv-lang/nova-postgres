@@ -1,0 +1,40 @@
+// src/postgres/ssl_test.nv — §Д8в criterion 2: the pure SSL negotiation.
+// Every mode × answer combination is decided by the adapter on top of
+// SslAnswer.classify; here the byte classification is pinned, including
+// the «any other byte» cases (an old server may answer with an
+// ErrorResponse whose tag 'E' arrives as the answer).
+
+module postgres
+
+test "SSL answer 'S' means TLS supported" {
+    match SslAnswer.classify('S' as u8) {
+        Ok(TlsSupported) => ()
+        Ok(TlsRefused) => assert(false, "'S' classified as refused")
+        Err(e) => assert(false, "'S' errored: ${e}")
+    }
+}
+
+test "SSL answer 'N' means TLS refused, plaintext continues" {
+    match SslAnswer.classify('N' as u8) {
+        Ok(TlsRefused) => ()
+        Ok(TlsSupported) => assert(false, "'N' classified as supported")
+        Err(e) => assert(false, "'N' errored: ${e}")
+    }
+}
+
+test "any other answer byte is a structured protocol error" {
+    // 'E' — an old server answering with ErrorResponse; 0x00 and a
+    // lowercase letter cover the rest of the space.
+    ro bytes []u8 = ['E' as u8, 0, 'x' as u8]
+    mut i = 0
+    while i < bytes.len() {
+        match SslAnswer.classify(bytes[i]) {
+            Ok(_) => assert(false, "byte ${bytes[i] as int} classified as an answer")
+            Err(e) => match e.kind {
+                Protocol { what } => assert(what == "expected 'S' or 'N' as the SSLRequest answer, got byte ${bytes[i] as int}", "wrong message: ${what}")
+                _ => assert(false, "wrong error kind")
+            }
+        }
+        i += 1
+    }
+}
