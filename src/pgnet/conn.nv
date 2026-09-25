@@ -39,12 +39,16 @@ export fn connect(host str, port int, user str, password str, database str) Net 
         },
         session: Session.new(user, password, database, Base64.encode(Random.bytes(18))),
     }
+    // On the error path conn is left unconsumed, so the auto-@cleanup
+    // (D432) closes it politely at scope exit — Terminate still reaches
+    // the server. The move out goes through a match arm on purpose: the
+    // `pump().map(|_| conn)` closure form compiled but regressed the live
+    // run ("simple query issued while the session is not ready" on the
+    // first query) — a minimal repro of that staleness did not surface in
+    // isolation, so the arm form stays as the verified one.
     match conn.pump() {
         Ok(_) => Ok(conn)
-        Err(e) => {
-            ro _fin = conn.close()
-            Err(e)
-        }
+        Err(e) => Err(e)
     }
 }
 
@@ -86,6 +90,15 @@ export fn Connection consume @close() Net -> Result[(), str] {
         Ok(()) => Ok(())
         Err(e) => Err("close: ${e}")
     }
+}
+
+/// Scope-exit cleanup (D432): a `Connection` bound as `consume conn = …`
+/// and left unconsumed — an early return out of connect, a forgotten close
+/// in a consumer — is closed politely at scope exit; the final flush
+/// (Terminate) still reaches the server. Explicit [`@close`] remains for
+/// callers that want to observe the write error.
+export fn Connection consume @cleanup(_outcome ScopeOutcome) Net -> () {
+    ro _r = @close()
 }
 
 // ──────────────────────────────────────────────────────────────────────────
