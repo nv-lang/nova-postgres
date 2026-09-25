@@ -1,0 +1,128 @@
+// src/pgnet/conn.nv — the thin network adapter of slice Д8б: the ONLY place
+// a socket moves. Everything protocol-shaped lives in the pure `postgres`
+// package (Session, ClientMessage, ServerMessage); this module just pumps
+// bytes between a std.net TcpStream and a Session: connect (startup +
+// authentication through whatever the server offers: trust, cleartext, MD5,
+// SCRAM-SHA-256), simple and extended queries, close.
+//
+// The SCRAM client nonce is drawn from the OS randomness here, at the edge —
+// the pure core never touches randomness.
+
+module postgres.pgnet
+
+import std.net.{TcpStream}
+import std.encoding.base64.{Base64}
+import postgres.{Session, PgEvent, ParamValue}
+
+/// A live PostgreSQL connection: a socket plus its pure Session state.
+/// A consume type, like both of its parts (D131): created by [`connect`],
+/// stepped by the query methods, ended exactly once by [`Connection @close`].
+export type Connection consume {
+    consume stream TcpStream
+    consume session Session
+}
+
+/// Connect to `host`:`port` and finish the start-up phase: StartupMessage,
+/// authentication (the session handles whichever method the server offers),
+/// ParameterStatus/BackendKeyData, up to the first ReadyForQuery. Returns a
+/// Ready connection; on failure the half-open connection is closed politely.
+export fn connect(host str, port int, user str, password str, database str) Net Random -> Result[Connection, str] {
+    ro addr = "${host}:${port}"
+    consume stream = match TcpStream.connect(addr) {
+        Ok(consume s) => s
+        Err(e) => return Err("connect ${addr}: ${e}")
+    }
+    consume session = Session.new(user, password, database, Base64.encode(Random.bytes(18)))
+    consume conn = Connection { stream, session }
+    match conn.pump() {
+        Ok(_) => Ok(conn)
+        Err(e) => {
+            ro _fin = conn.close()
+            Err(e)
+        }
+    }
+}
+
+/// Run one simple-protocol query and return every event up to (excluding)
+/// the ReadyForQuery that closes the cycle — the Ready event itself is
+/// dropped, everything before it is the answer. A server ErrorResponse is
+/// one of the events (QueryError carries the SQLSTATE); the connection
+/// stays usable.
+export fn Connection mut @simple_query(q str) Net -> Result[[]PgEvent, str] {
+    match @session.query(q) {
+        Ok(()) => ()
+        Err(e) => return Err("query: ${e}")
+    }
+    @pump()
+}
+
+/// Run one extended-protocol cycle (Parse/Bind/Describe/Execute/Sync, unnamed
+/// statement and portal, text formats on both sides) with `params` — SQL NULL
+/// as ParamValue.null(). Returns the events before the closing ReadyForQuery.
+export fn Connection mut @extended_query(sql str, params []ParamValue) Net -> Result[[]PgEvent, str] {
+    match @session.query_extended(sql, [], params, []) {
+        Ok(()) => ()
+        Err(e) => return Err("extended query: ${e}")
+    }
+    @pump()
+}
+
+/// Transaction-status byte of the last ReadyForQuery (`I`/`T`/`E`).
+export fn Connection @transaction_status() -> u8 =>
+    @session.transaction_status()
+
+/// Close politely: send everything the session still owes (Terminate last)
+/// and end the connection. Consumes it — after this call the connection
+/// cannot be used; the socket closes at scope end on its own (std.net
+/// auto-cleanup, same as the D8a smoke).
+export fn Connection consume @close() Net -> Result[(), str] {
+    ro fin = @session.close()
+    match @stream.write_all(fin) {
+        Ok(()) => Ok(())
+        Err(e) => Err("close: ${e}")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Pump: outbound bytes out, inbound bytes in, until ReadyForQuery
+// ──────────────────────────────────────────────────────────────────────────
+
+// One query round: drain the session to the socket, feed socket bytes back
+// until the Ready event arrives. The incremental decoder makes the chunk
+// size an implementation detail — any read size works.
+fn Connection mut @pump() Net -> Result[[]PgEvent, str] {
+    mut events []PgEvent = []PgEvent.new()
+    while true {
+        ro out = @session.drain()
+        if out.len() > 0 {
+            match @stream.write_all(out) {
+                Ok(()) => ()
+                Err(e) => return Err("write: ${e}")
+            }
+        }
+        ro chunk = match @stream.read_bytes(65536) {
+            Ok(b) => b
+            Err(e) => return Err("read: ${e}")
+        }
+        if chunk.len() == 0 {
+            return Err("read: server closed the connection")
+        }
+        ro evs = match @session.feed(chunk) {
+            Ok(e) => e
+            Err(e) => return Err("protocol: ${e}")
+        }
+        mut i = 0
+        while i < evs.len() {
+            match evs[i] {
+                Ready { .. } => {
+                    return Ok(events)
+                }
+                _ => {
+                    events.push(evs[i])
+                    i += 1
+                }
+            }
+        }
+    }
+    Ok(events)
+}
