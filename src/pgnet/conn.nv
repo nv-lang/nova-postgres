@@ -28,12 +28,17 @@ export type Connection consume {
 /// Ready connection; on failure the half-open connection is closed politely.
 export fn connect(host str, port int, user str, password str, database str) Net Random -> Result[Connection, str] {
     ro addr = "${host}:${port}"
-    consume stream = match TcpStream.connect(addr) {
-        Ok(consume s) => s
-        Err(e) => return Err("connect ${addr}: ${e}")
+    // No intermediate bindings: a bare `consume x = ...` binding gets an
+    // auto-@cleanup at scope exit (D432), which would close the socket
+    // when connect returns — build the record inline so the only binding
+    // is the connection itself.
+    consume conn = Connection {
+        stream: match TcpStream.connect(addr) {
+            Ok(consume s) => s
+            Err(e) => return Err("connect ${addr}: ${e}")
+        },
+        session: Session.new(user, password, database, Base64.encode(Random.bytes(18))),
     }
-    consume session = Session.new(user, password, database, Base64.encode(Random.bytes(18)))
-    consume conn = Connection { stream, session }
     match conn.pump() {
         Ok(_) => Ok(conn)
         Err(e) => {
