@@ -1,0 +1,15 @@
+# nova.toml — nova-postgres example: the §Д8б session checks (all scripted
+# dialogs, cut-at-every-point, illegal transitions, transaction status) as a
+# runnable program. The package's own test runner merges all of src/ into one
+# C file, which this compiler miscompiles for the session surface (see
+# repro-local/ and the D8b hand-over); a normally compiled binary like this
+# one lowers the same code correctly, so the checks live here and run green.
+# The package's ./nova.sh test src stays the D8a suite (PASS: 1 FAIL: 0).
+
+[package]
+name = "postgres-example-session-check"
+version = "0.1.0"
+description = "Scripted Session dialogs, cut-at-every-point, illegal transitions, transaction status"
+
+[dependencies]
+postgres = { path = "../.." }

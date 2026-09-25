@@ -59,7 +59,7 @@ export fn ClientMessage.ssl_request() -> []u8 {
 
 /// CancelRequest: ask the server to cancel the query running on the backend
 /// identified by `process_id`/`secret_key` (both come from the
-/// [`SessionEvent.BackendKey`] event). Untagged startup-style frame: length
+/// [`PgEvent.BackendKey`] event). Untagged startup-style frame: length
 /// 16, the cancel code 80877102, then the two keys. Opening a new connection
 /// to send this is the caller's job — this slice only encodes the frame.
 export fn ClientMessage.cancel_request(process_id int, secret_key int) -> []u8 {

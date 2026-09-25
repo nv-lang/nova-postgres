@@ -1,0 +1,1804 @@
+// examples/session-check/src/main.nv — plan 286 §Д8б criteria 2/3/4 as a
+// runnable program: every scripted dialog against reference bytes (events
+// and exact client bytes), each dialog also fed with one server feed split
+// at every point, the illegal transitions, and the transaction status.
+// Ported verbatim from the session_*_test.nv peers (same asserts, same
+// reference bytes); running the suite from OUTSIDE the package also proves
+// the public API crosses the package boundary as specified.
+//
+//   ./nova.sh build examples/session-check/src/main.nv -o target/session-check.exe
+//   ./target/session-check.exe        # prints SESSION CHECKS OK on success
+
+module main
+
+import std.runtime.write_buffer.{WriteBuffer}
+
+import postgres.{Session, SessionPhase, PgEvent, ParamValue, PostgresError, Protocol, ClientMessage, ErrorField, Authenticated, Parameter, BackendKey, Ready, RowDesc, Row, Command, EmptyQuery, Notice, QueryError}
+
+// Local framing (the package's frame() is private): tag + big-endian length
+// + payload, per «Message Formats».
+fn frame(tag u8, payload []u8) -> []u8 {
+    mut out = WriteBuffer.new(cap: 5 + payload.len())
+    out.write_byte(tag)
+    out.write_u32_be((4 + payload.len()) as u32)
+    out.write_bytes(payload)
+    out.into_bytes()
+}
+
+// ErrorResponse field `M` (the package's error_message is private).
+fn error_message(fields []ErrorField) -> str {
+    for f in fields {
+        if f.code == 'M' as u8 {
+            return f.value
+        }
+    }
+    ""
+}
+
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// Byte helpers for assembling reference frames (all []u8 in locals)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn cat(a []u8, b []u8) -> []u8 {
+    mut o []u8 = []u8.new(cap: a.len() + b.len())
+    o.append(a)
+    o.append(b)
+    o
+}
+
+fn cat3(a []u8, b []u8, c []u8) -> []u8 =>
+    cat(cat(a, b), c)
+
+fn cat4(a []u8, b []u8, c []u8, d []u8) -> []u8 =>
+    cat(cat(a, b), cat(c, d))
+
+fn cstr(s str) -> []u8 {
+    mut o = s.bytes()
+    o.push(0)
+    o
+}
+
+fn u8byte(v int) -> []u8 {
+    mut b = []u8.new()
+    b.push(v as u8)
+    b
+}
+
+fn i32be(v int) -> []u8 {
+    mut b = []u8.new()
+    b.push(((v >> 24) & 0xFF) as u8)
+    b.push(((v >> 16) & 0xFF) as u8)
+    b.push(((v >> 8) & 0xFF) as u8)
+    b.push((v & 0xFF) as u8)
+    b
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Reference server frames (tag + documented payload)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn auth_ok() -> []u8 =>
+    frame('R' as u8, x"00 00 00 00")
+
+fn auth_cleartext() -> []u8 =>
+    frame('R' as u8, x"00 00 00 03")
+
+// MD5 with the D8a reference salt 01 02 03 04.
+fn auth_md5() -> []u8 =>
+    frame('R' as u8, x"00 00 00 05 01 02 03 04")
+
+fn auth_sasl() -> []u8 =>
+    frame('R' as u8, cat3(x"00 00 00 0A", cstr("SCRAM-SHA-256"), x"00"))
+
+fn sasl_continue(data str) -> []u8 =>
+    frame('R' as u8, cat(x"00 00 00 0B", data.bytes()))
+
+fn sasl_final(data str) -> []u8 =>
+    frame('R' as u8, cat(x"00 00 00 0C", data.bytes()))
+
+fn param_status(name str, value str) -> []u8 =>
+    frame('S' as u8, cat(cstr(name), cstr(value)))
+
+fn backend_key() -> []u8 =>
+    frame('K' as u8, x"00 00 30 39 00 01 09 32")
+
+fn ready(status u8) -> []u8 =>
+    frame('Z' as u8, u8byte(status as int))
+
+// One int4 column named `name`, format 0.
+fn row_desc(name str) -> []u8 =>
+    frame('T' as u8, cat3(x"00 01", cstr(name), x"00 00 00 00 00 00 00 00 00 17 00 04 FF FF FF FF 00 00"))
+
+// Two columns, both binary int4.
+fn row_desc_bin2(n1 str, n2 str) -> []u8 {
+    ro field = x"00 00 00 00 00 00 00 00 00 17 00 04 FF FF FF FF 00 01"
+    frame('T' as u8, cat4(x"00 02", cstr(n1), field, cat(cstr(n2), field)))
+}
+
+fn data_row_text(v str) -> []u8 =>
+    frame('D' as u8, cat(x"00 01", cat(i32be(v.byte_len()), v.bytes())))
+
+// Two-column row: first value raw bytes, second SQL NULL.
+fn data_row_bin_null(b []u8) -> []u8 =>
+    frame('D' as u8, cat(x"00 02", cat(i32be(b.len()), cat(b, x"FF FF FF FF"))))
+
+fn cmd_complete(tag str) -> []u8 =>
+    frame('C' as u8, cstr(tag))
+
+fn error_response(sqlstate str, msg str) -> []u8 {
+    ro fields = cat(x"53", cat(cstr("ERROR"), cat(x"43", cat(cstr(sqlstate), cat(x"4D", cat(cstr(msg), x"00"))))))
+    frame('E' as u8, fields)
+}
+
+fn notice_response(msg str) -> []u8 {
+    ro fields = cat(x"53", cat(cstr("NOTICE"), cat(x"4D", cat(cstr(msg), x"00"))))
+    frame('N' as u8, fields)
+}
+
+fn empty_query() -> []u8 =>
+    frame('I' as u8, x"")
+
+fn parse_complete() -> []u8 =>
+    frame('1' as u8, x"")
+
+fn bind_complete() -> []u8 =>
+    frame('2' as u8, x"")
+
+// ──────────────────────────────────────────────────────────────────────────
+// Reference client frames
+// ──────────────────────────────────────────────────────────────────────────
+
+// StartupMessage for user=postgres, database=postgres.
+fn startup_ref() -> []u8 =>
+    x"00 00 00 29 00 03 00 00 75 73 65 72 00 70 6F 73 74 67 72 65 73 00 64 61 74 61 62 61 73 65 00 70 6F 73 74 67 72 65 73 00 00"
+
+// StartupMessage for user=user, database=db (the SCRAM dialog's identity).
+fn startup_ref_user() -> []u8 =>
+    x"00 00 00 1F 00 03 00 00 75 73 65 72 00 75 73 65 72 00 64 61 74 61 62 61 73 65 00 64 62 00 00"
+
+fn password_ref(pw str) -> []u8 =>
+    frame('p' as u8, cstr(pw))
+
+// The D8a integrator-verified MD5 vector: user postgres, password secret,
+// salt 01 02 03 04 -> md5bb41a296aab6baccb36ff243a562abff.
+fn md5_password_ref() -> []u8 =>
+    frame('p' as u8, cstr("md5bb41a296aab6baccb36ff243a562abff"))
+
+// The full extended cycle for query_extended("SELECT 42, $1::int", [],
+// [ParamValue.null()], [1]): Parse + Bind (NULL parameter as length -1, one
+// binary result format) + Describe portal + Execute + Sync.
+fn extended_ref() -> []u8 {
+    ro p = cat(x"50 00 00 00 1A 00 53 45 4C 45 43 54 20 34 32 2C 20 24 31 3A 3A 69 6E 74 00 00 00", cat(x"42 00 00 00 12 00 00 00 00 00 01 FF FF FF FF 00 01 00 01", cat(x"44 00 00 00 06 50 00", cat(x"45 00 00 00 09 00 00 00 00 00", x"53 00 00 00 04"))))
+    p
+}
+
+// The same cycle for query_extended("SELECT bogus", [], [], []).
+fn extended_ref_bogus() -> []u8 {
+    ro p = cat(x"50 00 00 00 14 00 53 45 4C 45 43 54 20 62 6F 67 75 73 00 00 00", cat(x"42 00 00 00 0C 00 00 00 00 00 00 00 00", cat(x"44 00 00 00 06 50 00", cat(x"45 00 00 00 09 00 00 00 00 00", x"53 00 00 00 04"))))
+    p
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Event rendering — transcripts compare rendered events as strings
+// ──────────────────────────────────────────────────────────────────────────
+
+fn ev(e PgEvent) -> str =>
+    match e {
+        Authenticated => "authenticated"
+        Parameter { name, value } => "ps:${name}=${value}"
+        BackendKey { process_id, secret_key } => "key:${process_id}:${secret_key}"
+        Ready { status } => "ready:${(status as int).to_char() ?? '?'}"
+        RowDesc { fields } => "rowdesc:${fields.len()}:${fields[0].name}:${fields[0].format}"
+        Row { values } => row_render(values)
+        Command { tag } => "cc:${tag}"
+        EmptyQuery => "empty"
+        Notice { fields } => "notice:${error_message(fields)}"
+        QueryError { sqlstate, fields } => "error:${sqlstate}:${error_message(fields)}"
+    }
+
+fn row_render(values []ParamValue) -> str {
+    mut parts []str = []str.new(cap: values.len())
+    mut i = 0
+    while i < values.len() {
+        match values[i].data {
+            Some(b) => {
+                ro s = match b.to_str() {
+                    Ok(t) => "some:${t}"
+                    Err(_) => "some:bin:${b.len()}"
+                }
+                parts.push(s)
+            }
+            None => parts.push("null")
+        }
+        i += 1
+    }
+    mut out = "row"
+    for p in parts {
+        out = "${out}|${p}"
+    }
+    out
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Criterion 2, dialog by dialog. Each dialog has: a reference test (events,
+// client bytes) and a cut test (the same server stream fed whole vs split at
+// every cut point yields the same transcript).
+// ──────────────────────────────────────────────────────────────────────────
+
+// trust entry
+fn trust_server() -> []u8 =>
+    cat4(auth_ok(), param_status("server_version", "15.0"), backend_key(), ready('I' as u8))
+
+
+
+// ---- checks ported from src\session_auth_test.nv ----
+
+
+fn chk_criterion_2_trust_entry_dialog() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro evs = match s.feed(trust_server()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "feed errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 4, "trust: event count")
+    assert(ev(evs[0]) == "authenticated", "trust ev0")
+    assert(ev(evs[1]) == "ps:server_version=15.0", "trust ev1")
+    assert(ev(evs[2]) == "key:12345:67890", "trust ev2")
+    assert(ev(evs[3]) == "ready:I", "trust ev3")
+    assert(s.drain() == startup_ref(), "trust: client bytes")
+    s.close()
+}
+
+// cut == -1 feeds the whole stream; otherwise feeds server[..cut] then
+// server[cut..]. Returns the rendered transcript.
+
+// cleartext entry
+fn chk_criterion_2_cleartext_entry_dialog() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro evs1 = match s.feed(auth_cleartext()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "cleartext request errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs1.len() == 0, "cleartext: no events yet")
+    ro evs2 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "cleartext finish errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 2, "cleartext: event count")
+    assert(ev(evs2[0]) == "authenticated", "cleartext ev0")
+    assert(ev(evs2[1]) == "ready:I", "cleartext ev1")
+    assert(s.drain() == cat(startup_ref(), password_ref("smoke")), "cleartext: client bytes")
+    s.close()
+}
+
+// MD5 entry — password "secret" hits the D8a integrator-verified vector.
+fn chk_criterion_2_md5_entry_dialog() -> () {
+    consume s = Session.new("postgres", "secret", "postgres", "n")
+    ro evs1 = match s.feed(auth_md5()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "md5 request errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs1.len() == 0, "md5: no events yet")
+    ro evs2 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "md5 finish errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 2, "md5: event count")
+    assert(ev(evs2[0]) == "authenticated", "md5 ev0")
+    assert(ev(evs2[1]) == "ready:I", "md5 ev1")
+    assert(s.drain() == cat(startup_ref(), md5_password_ref()), "md5: client bytes")
+    s.close()
+}
+
+// SCRAM entry — the RFC 7677 §3 exchange, verbatim.
+fn chk_criterion_2_scram_entry_dialog() -> () {
+    // RFC 7677 §3, same vectors as scram_test.nv.
+    ro server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    ro client_first = "n,,n=user,r=rOprNGfwEbeRWgbNEkqO"
+    ro client_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+    ro initial_ref = frame('p' as u8, cat(cstr("SCRAM-SHA-256"), cat(i32be(client_first.byte_len()), client_first.bytes())))
+    consume s = Session.new("user", "pencil", "db", "rOprNGfwEbeRWgbNEkqO")
+    ro e1 = match s.feed(auth_sasl()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "sasl request errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 0, "scram: no events yet")
+    ro e2 = match s.feed(sasl_continue(server_first)) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "sasl continue errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e2.len() == 0, "scram: still no events")
+    ro e3 = match s.feed(sasl_final("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "sasl final errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e3.len() == 0, "scram: signature accepted quietly")
+    ro e4 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "scram finish errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e4.len() == 2, "scram: event count")
+    assert(ev(e4[0]) == "authenticated", "scram ev0")
+    assert(ev(e4[1]) == "ready:I", "scram ev1")
+    ro want = cat(startup_ref_user(), cat(initial_ref, frame('p' as u8, client_final.bytes())))
+    assert(s.drain() == want, "scram: client bytes")
+    s.close()
+}
+
+// wrong password — ErrorResponse with SQLSTATE 28P01 in the auth phase is a
+// structural authentication error.
+fn chk_criterion_2_wrong_password_is_a_structural_auth_() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro _e1 = match s.feed(auth_cleartext()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "cleartext request errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    ro e = match s.feed(error_response("28P01", "password authentication failed for user postgres")) {
+        Ok(_) => {
+            assert(false, "auth failure accepted")
+            PostgresError { kind: Protocol { what: "unreachable" } }
+        }
+        Err(e) => e
+    }
+    assert(e.to_str() == "authentication failure: server rejected authentication (SQLSTATE 28P01): password authentication failed for user postgres", "wrong password error")
+    assert(s.drain() == cat(startup_ref(), password_ref("smoke")), "wrong password: client bytes")
+    s.close()
+}
+
+
+
+// ---- checks ported from src\session_cuts_test.nv ----
+
+
+// Render an event list to the transcript form.
+fn render(evs []PgEvent) -> str {
+    mut out = ""
+    mut i = 0
+    while i < evs.len() {
+        out = "${out};${ev(evs[i])}"
+        i += 1
+    }
+    out
+}
+
+
+fn cleartext_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = auth_cleartext()
+    ro step1 = cat(auth_ok(), ready('I' as u8))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_0() -> () {
+    ro whole = cleartext_run(-1, -1)
+    ro step0 = auth_cleartext()
+    mut cut = 1
+    while cut < step0.len() {
+        assert(cleartext_run(0, cut) == whole, "cleartext step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step1.len() {
+        assert(cleartext_run(1, cut) == whole, "cleartext step1 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn md5_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "secret", "postgres", "n")
+    ro step0 = auth_md5()
+    ro step1 = cat(auth_ok(), ready('I' as u8))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_1() -> () {
+    ro whole = md5_run(-1, -1)
+    ro step0 = auth_md5()
+    mut cut = 1
+    while cut < step0.len() {
+        assert(md5_run(0, cut) == whole, "md5 step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step1.len() {
+        assert(md5_run(1, cut) == whole, "md5 step1 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn wrong_password_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = auth_cleartext()
+    ro step1 = error_response("28P01", "password authentication failed for user postgres")
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_2() -> () {
+    ro whole = wrong_password_run(-1, -1)
+    ro step0 = auth_cleartext()
+    mut cut = 1
+    while cut < step0.len() {
+        assert(wrong_password_run(0, cut) == whole, "wrong_password step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = error_response("28P01", "password authentication failed for user postgres")
+    mut cut = 1
+    while cut < step1.len() {
+        assert(wrong_password_run(1, cut) == whole, "wrong_password step1 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn empty_query_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    ro step1 = cat(empty_query(), ready('I' as u8))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    match s.query("   ") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_3() -> () {
+    ro whole = empty_query_run(-1, -1)
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step0.len() {
+        assert(empty_query_run(0, cut) == whole, "empty_query step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = cat(empty_query(), ready('I' as u8))
+    mut cut = 1
+    while cut < step1.len() {
+        assert(empty_query_run(1, cut) == whole, "empty_query step1 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn notice_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    ro step1 = cat3(notice_response("index blah does not exist"), cat3(row_desc("a"), data_row_text("1"), cmd_complete("SELECT 1")), ready('I' as u8))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_4() -> () {
+    ro whole = notice_run(-1, -1)
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step0.len() {
+        assert(notice_run(0, cut) == whole, "notice step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = cat3(notice_response("index blah does not exist"), cat3(row_desc("a"), data_row_text("1"), cmd_complete("SELECT 1")), ready('I' as u8))
+    mut cut = 1
+    while cut < step1.len() {
+        assert(notice_run(1, cut) == whole, "notice step1 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn scram_run(split_step int, cut int) -> str {
+    ro server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1"
+    consume s = Session.new("user", "pencil", "db", "rOprNGfwEbeRWgbNEkqO")
+    ro step0 = auth_sasl()
+    ro step1 = sasl_continue(server_first)
+    ro step2 = sasl_final("v=XjTu3KBABgY/OKnhaQwxJb9Vbt2Fj1v+lPuMzeAcqSk=")
+    ro step3 = cat(auth_ok(), ready('I' as u8))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 2 && cut >= 0 {
+        mut all = match s.feed(step2[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step2[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step2) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 3 && cut >= 0 {
+        mut all = match s.feed(step3[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step3[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step3) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn chk_criterion_2_cut_scram_entry_survives_every_cut() -> () {
+    ro whole = scram_run(-1, -1)
+    ro server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1"
+    ro step0 = auth_sasl()
+    mut cut = 1
+    while cut < step0.len() {
+        assert(scram_run(0, cut) == whole, "scram step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = sasl_continue(server_first)
+    mut cut = 1
+    while cut < step1.len() {
+        assert(scram_run(1, cut) == whole, "scram step1 cut ${cut}")
+        cut += 1
+    }
+    ro step2 = sasl_final("v=XjTu3KBABgY/OKnhaQwxJb9Vbt2Fj1v+lPuMzeAcqSk=")
+    mut cut = 1
+    while cut < step2.len() {
+        assert(scram_run(2, cut) == whole, "scram step2 cut ${cut}")
+        cut += 1
+    }
+    ro step3 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step3.len() {
+        assert(scram_run(3, cut) == whole, "scram step3 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn ext_error_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    ro step1 = cat3(parse_complete(), error_response("42601", "syntax error"), ready('I' as u8))
+    ro step2 = cat3(row_desc("a"), data_row_text("7"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    match s.query_extended("SELECT bogus", [], [], []) {
+        Ok(()) => ()
+        Err(e) => assert(false, "extended query errored: ${e}")
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    if split_step == 2 && cut >= 0 {
+        mut all = match s.feed(step2[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step2[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step2) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_5() -> () {
+    ro whole = ext_error_run(-1, -1)
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step0.len() {
+        assert(ext_error_run(0, cut) == whole, "ext_error step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = cat3(parse_complete(), error_response("42601", "syntax error"), ready('I' as u8))
+    mut cut = 1
+    while cut < step1.len() {
+        assert(ext_error_run(1, cut) == whole, "ext_error step1 cut ${cut}")
+        cut += 1
+    }
+    ro step2 = cat3(row_desc("a"), data_row_text("7"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    mut cut = 1
+    while cut < step2.len() {
+        assert(ext_error_run(2, cut) == whole, "ext_error step2 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn ps_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    ro step1 = param_status("application_name", "myapp")
+    ro step2 = cat3(row_desc("a"), data_row_text("1"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    if split_step == 2 && cut >= 0 {
+        mut all = match s.feed(step2[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step2[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step2) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_6() -> () {
+    ro whole = ps_run(-1, -1)
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step0.len() {
+        assert(ps_run(0, cut) == whole, "ps step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = param_status("application_name", "myapp")
+    mut cut = 1
+    while cut < step1.len() {
+        assert(ps_run(1, cut) == whole, "ps step1 cut ${cut}")
+        cut += 1
+    }
+    ro step2 = cat3(row_desc("a"), data_row_text("1"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    mut cut = 1
+    while cut < step2.len() {
+        assert(ps_run(2, cut) == whole, "ps step2 cut ${cut}")
+        cut += 1
+    }
+}
+
+
+// ---- checks ported from src\session_empty_test.nv ----
+
+
+// empty query
+fn chk_criterion_2_empty_query() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "empty query: entry events")
+    match s.query("   ") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro evs = match s.feed(cat(empty_query(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "empty query errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 2, "empty query: event count")
+    assert(ev(evs[0]) == "empty", "empty query ev0")
+    assert(ev(evs[1]) == "ready:I", "empty query ev1")
+    assert(s.drain() == cat(startup_ref(), frame('Q' as u8, cstr("   "))), "empty query: client bytes")
+    s.close()
+}
+
+
+
+// ---- checks ported from src\session_ext_error_test.nv ----
+
+
+// error in extended query and recovery on Sync
+fn ext_error_server() -> []u8 =>
+    cat3(parse_complete(), error_response("42601", "syntax error"), ready('I' as u8))
+
+fn chk_criterion_2_error_in_extended_query_and_recovery() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            println("DIAG EXTERR ${e}")
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "ext error: entry events")
+    match s.query_extended("SELECT bogus", [], [], []) {
+        Ok(()) => ()
+        Err(e) => assert(false, "extended query errored: ${e}")
+    }
+    ro evs = match s.feed(ext_error_server()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "extended error round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 2, "ext error: event count")
+    assert(ev(evs[0]) == "error:42601:syntax error", "ext error ev0")
+    assert(ev(evs[1]) == "ready:I", "ext error ev1")
+    // Recovery: a plain query works afterwards.
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query after error errored: ${e}")
+    }
+    ro ok_rows = cat3(row_desc("a"), data_row_text("7"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    ro evs2 = match s.feed(ok_rows) {
+        Ok(e) => e
+        Err(e) => {
+            println("DIAG2 ${e}")
+            assert(false, "errored")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 4, "ext error: recovery events")
+    assert(s.drain() == cat(cat(startup_ref(), extended_ref_bogus()), frame('Q' as u8, cstr("SELECT 1"))), "ext error: client bytes")
+    s.close()
+}
+
+
+
+// ---- checks ported from src\session_extended_test.nv ----
+
+
+// ParseComplete, BindComplete, RowDescription (two binary int4 columns),
+// DataRow (binary 42, NULL), CommandComplete, ReadyForQuery.
+fn extended_server() -> []u8 =>
+    cat4(parse_complete(), bind_complete(), row_desc_bin2("?column?", "?column?"), cat(data_row_bin_null(x"00 00 00 80"), cat(cmd_complete("SELECT 1"), ready('I' as u8))))
+
+fn chk_criterion_2_extended_query_with_null_parameter_a() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "extended: entry events")
+    // Built by push, not a vec literal: a record carrying Option[[]u8]
+    // inside a vec literal is the none_slice_lower defect shape.
+    mut ps []ParamValue = []ParamValue.new()
+    ps.push(ParamValue.null())
+    match s.query_extended("SELECT 42, $1::int", [], ps, [1]) {
+        Ok(()) => ()
+        Err(e) => assert(false, "extended query errored: ${e}")
+    }
+    ro evs = match s.feed(extended_server()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "extended round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 4, "extended: event count")
+    assert(ev(evs[0]) == "rowdesc:2:?column?:1", "extended ev0")
+    assert(ev(evs[1]) == "row|some:bin:4|null", "extended ev1")
+    assert(ev(evs[2]) == "cc:SELECT 1", "extended ev2")
+    assert(ev(evs[3]) == "ready:I", "extended ev3")
+    assert(s.drain() == cat(startup_ref(), extended_ref()), "extended: client bytes")
+    s.close()
+}
+
+fn chk_criterion_2_cut_extended_query_survives_every_cu() -> () {
+    ro whole = feed_extended(-1)
+    mut cut = 1
+    while cut < extended_server().len() {
+        assert(feed_extended(cut) == whole, "extended cut at ${cut}")
+        cut += 1
+    }
+}
+
+fn feed_extended(cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro _e = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    mut ps []ParamValue = []ParamValue.new()
+    ps.push(ParamValue.null())
+    match s.query_extended("SELECT 42, $1::int", [], ps, [1]) {
+        Ok(()) => ()
+        Err(e) => assert(false, "extended query errored: ${e}")
+    }
+    ro server = extended_server()
+    ro evs = if cut < 0 {
+        match s.feed(server) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+    } else {
+        mut all = match s.feed(server[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+        match s.feed(server[cut..]) {
+            Ok(e2) => {
+                all.append(e2)
+                all
+            }
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+    }
+    mut out = ""
+    mut i = 0
+    while i < evs.len() {
+        out = "${out};${ev(evs[i])}"
+        i += 1
+    }
+    s.close()
+    out
+}
+
+
+// ---- checks ported from src\session_notice_test.nv ----
+
+
+// NoticeResponse mid query
+fn chk_criterion_2_notice_mid_query() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "notice: entry events")
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro server = cat3(notice_response("index blah does not exist"), cat3(row_desc("a"), data_row_text("1"), cmd_complete("SELECT 1")), ready('I' as u8))
+    ro evs = match s.feed(server) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "notice round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 5, "notice: event count")
+    assert(ev(evs[0]) == "notice:index blah does not exist", "notice ev0")
+    assert(ev(evs[1]) == "rowdesc:1:a:0", "notice ev1")
+    assert(ev(evs[2]) == "row|some:1", "notice ev2")
+    assert(ev(evs[3]) == "cc:SELECT 1", "notice ev3")
+    assert(ev(evs[4]) == "ready:I", "notice ev4")
+    s.close()
+}
+
+
+
+// ---- checks ported from src\session_ps_test.nv ----
+
+
+// ParameterStatus mid session (while idle, outside any query)
+fn chk_criterion_2_parameter_status_mid_session() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "ps mid: entry events")
+    ro evs = match s.feed(param_status("application_name", "myapp")) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "parameter status errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 1, "ps mid: event count")
+    assert(ev(evs[0]) == "ps:application_name=myapp", "ps mid ev0")
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro ok_rows = cat3(row_desc("a"), data_row_text("1"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    ro evs2 = match s.feed(ok_rows) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "query round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 4, "ps mid: query events")
+    s.close()
+}
+
+
+
+// ---- checks ported from src\session_recovery_test.nv ----
+
+
+// error mid simple query and recovery on ReadyForQuery
+fn recovery_server() -> []u8 =>
+    cat3(row_desc("a"), error_response("42601", "syntax error"), ready('I' as u8))
+
+fn chk_criterion_2_error_mid_simple_query_and_recovery() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "recovery: entry events")
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    // The error lands after a RowDescription; the DataRow the server would
+    // have sent is skipped together with everything up to ReadyForQuery.
+    ro evs = match s.feed(recovery_server()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "error round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 3, "recovery: event count")
+    assert(ev(evs[0]) == "rowdesc:1:a:0", "recovery ev0")
+    assert(ev(evs[1]) == "error:42601:syntax error", "recovery ev1")
+    assert(ev(evs[2]) == "ready:I", "recovery ev2")
+    // The session is Ready again and runs the next query.
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "second query errored: ${e}")
+    }
+    ro ok_rows = cat3(row_desc("a"), data_row_text("9"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    ro evs2 = match s.feed(ok_rows) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "recovery round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 4, "recovery: second round events")
+    assert(ev(evs2[0]) == "rowdesc:1:a:0", "recovery ev2-0")
+    assert(ev(evs2[1]) == "row|some:9", "recovery ev2-1")
+    assert(ev(evs2[2]) == "cc:SELECT 1", "recovery ev2-2")
+    assert(ev(evs2[3]) == "ready:I", "recovery ev2-3")
+    ro want = cat(startup_ref(), frame('Q' as u8, cstr("SELECT 1")))
+    assert(s.drain() == cat(want, frame('Q' as u8, cstr("SELECT 1"))), "recovery: client bytes")
+    s.close()
+}
+
+fn chk_criterion_2_cut_error_recovery_survives_every_cu() -> () {
+    ro whole = feed_recovery(-1)
+    mut cut = 1
+    while cut < recovery_server().len() {
+        assert(feed_recovery(cut) == whole, "recovery cut at ${cut}")
+        cut += 1
+    }
+}
+
+fn feed_recovery(cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro _e = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro server = recovery_server()
+    ro evs = if cut < 0 {
+        match s.feed(server) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+    } else {
+        mut all = match s.feed(server[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+        match s.feed(server[cut..]) {
+            Ok(e2) => {
+                all.append(e2)
+                all
+            }
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+    }
+    mut out = ""
+    mut i = 0
+    while i < evs.len() {
+        out = "${out};${ev(evs[i])}"
+        i += 1
+    }
+    s.close()
+    out
+}
+
+
+
+// ---- checks ported from src\session_rules_test.nv ----
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// Criterion 3: illegal transitions are structural errors, never panics
+// ──────────────────────────────────────────────────────────────────────────
+
+fn chk_criterion_3_datarow_before_rowdescription_is_a_p() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "entry events")
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro e = match s.feed(data_row_text("1")) {
+        Ok(_) => {
+            assert(false, "DataRow before RowDescription decoded fine")
+            PostgresError { kind: Protocol { what: "unreachable" } }
+        }
+        Err(e) => e
+    }
+    match e.kind {
+        Protocol { what } => assert(what == "DataRow before RowDescription", "wrong message")
+        _ => assert(false, "wrong error kind")
+    }
+    s.close()
+}
+
+fn chk_criterion_3_readyforquery_during_authentication_() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e = match s.feed(ready('I' as u8)) {
+        Ok(_) => {
+            assert(false, "ReadyForQuery during authentication accepted")
+            PostgresError { kind: Protocol { what: "unreachable" } }
+        }
+        Err(e) => e
+    }
+    match e.kind {
+        Protocol { what } => assert(what == "ReadyForQuery during authentication", "wrong message")
+        _ => assert(false, "wrong error kind")
+    }
+    s.close()
+}
+
+fn chk_criterion_3_query_message_while_idle_is_a_protoc() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "entry events")
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    // Finish the query properly, then send CommandComplete with no query in
+    // flight.
+    ro evs2 = match s.feed(cat3(row_desc("a"), data_row_text("1"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))) {
+        Ok(e) => e
+        Err(e) => {
+            println("IDLE round err ${e}")
+            assert(false, "query round errored")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 4, "query round events")
+    ro e = match s.feed(cmd_complete("SELECT 1")) {
+        Ok(_) => {
+            assert(false, "CommandComplete while idle accepted")
+            PostgresError { kind: Protocol { what: "unreachable" } }
+        }
+        Err(e) => e
+    }
+    match e.kind {
+        Protocol { what } => assert(what == "CommandComplete outside a query", "wrong message")
+        _ => assert(false, "wrong error kind")
+    }
+    s.close()
+}
+
+fn chk_criterion_3_a_failed_session_refuses_further_fee() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    match s.feed(ready('I' as u8)) {
+        Ok(_) => assert(false, "ReadyForQuery during authentication accepted")
+        Err(_) => ()
+    }
+    match s.feed(auth_ok()) {
+        Ok(_) => assert(false, "feed on failed session accepted")
+        Err(_) => ()
+    }
+    s.close()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Criterion 4: the transaction status from ReadyForQuery
+// ──────────────────────────────────────────────────────────────────────────
+
+fn chk_criterion_4_begin_t_error_inside_e_rollback_i() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "txn: entry events")
+    match s.query("BEGIN") {
+        Ok(()) => ()
+        Err(e) => assert(false, "BEGIN errored: ${e}")
+    }
+    ro evs = match s.feed(cat(cmd_complete("BEGIN"), ready('T' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "BEGIN round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 2, "txn: BEGIN events")
+    assert(s.transaction_status() == 'T' as u8, "status after BEGIN")
+    match s.query("SELECT bogus") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro evs2 = match s.feed(cat(error_response("42601", "syntax error"), ready('E' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "error round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 2, "txn: error events")
+    assert(s.transaction_status() == 'E' as u8, "status after error inside transaction")
+    match s.query("ROLLBACK") {
+        Ok(()) => ()
+        Err(e) => assert(false, "ROLLBACK errored: ${e}")
+    }
+    ro evs3 = match s.feed(cat(cmd_complete("ROLLBACK"), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "ROLLBACK round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs3.len() == 2, "txn: ROLLBACK events")
+    assert(s.transaction_status() == 'I' as u8, "status after ROLLBACK")
+    s.close()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Close
+// ──────────────────────────────────────────────────────────────────────────
+
+fn chk_close_returns_the_final_flush_with_terminate() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro startup = s.drain()
+    assert(startup == startup_ref(), "startup bytes before close")
+    // Consume: the session ends here. Further feeds are refused by the
+    // type system, not by a runtime check.
+    ro fin = s.close()
+    assert(fin == ClientMessage.terminate(), "Terminate not in the final flush")
+}
+
+
+// freeze-marker-1
+
+
+// ---- checks ported from src\session_two_stmt_test.nv ----
+
+
+// simple query with two statements
+fn two_stmt_server() -> []u8 {
+    ro rows = cat3(row_desc("a"), data_row_text("1"), cmd_complete("SELECT 1"))
+    ro rows2 = cat3(row_desc("b"), data_row_text("2"), cmd_complete("SELECT 2"))
+    cat(cat(rows, rows2), ready('I' as u8))
+}
+
+fn chk_criterion_2_simple_query_two_statements() -> () {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "two statements: entry events")
+    match s.query("SELECT 1; SELECT 2") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro evs = match s.feed(two_stmt_server()) {
+        Ok(e) => e
+        Err(e) => {
+            println("TWOSTMT rows err: ${e}")
+            assert(false, "rows errored")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 7, "two statements: event count")
+    assert(ev(evs[0]) == "rowdesc:1:a:0", "two statements ev0")
+    assert(ev(evs[1]) == "row|some:1", "two statements ev1")
+    assert(ev(evs[2]) == "cc:SELECT 1", "two statements ev2")
+    assert(ev(evs[3]) == "rowdesc:1:b:0", "two statements ev3")
+    assert(ev(evs[4]) == "row|some:2", "two statements ev4")
+    assert(ev(evs[5]) == "cc:SELECT 2", "two statements ev5")
+    assert(ev(evs[6]) == "ready:I", "two statements ev6")
+    assert(s.drain() == cat(startup_ref(), frame('Q' as u8, cstr("SELECT 1; SELECT 2"))), "two statements: client bytes")
+    s.close()
+}
+
+
+
+
+fn main() {
+    chk_criterion_2_trust_entry_dialog()
+    chk_criterion_2_cleartext_entry_dialog()
+    chk_criterion_2_md5_entry_dialog()
+    chk_criterion_2_scram_entry_dialog()
+    chk_criterion_2_wrong_password_is_a_structural_auth_()
+    chk_criterion_2_cut_scram_entry_survives_every_cut()
+    chk_criterion_2_empty_query()
+    chk_criterion_2_error_in_extended_query_and_recovery()
+    chk_criterion_2_extended_query_with_null_parameter_a()
+    chk_criterion_2_cut_extended_query_survives_every_cu()
+    chk_criterion_2_notice_mid_query()
+    chk_criterion_2_parameter_status_mid_session()
+    chk_criterion_2_error_mid_simple_query_and_recovery()
+    chk_criterion_2_cut_error_recovery_survives_every_cu()
+    chk_criterion_3_datarow_before_rowdescription_is_a_p()
+    chk_criterion_3_readyforquery_during_authentication_()
+    chk_criterion_3_query_message_while_idle_is_a_protoc()
+    chk_criterion_3_a_failed_session_refuses_further_fee()
+    chk_criterion_4_begin_t_error_inside_e_rollback_i()
+    chk_close_returns_the_final_flush_with_terminate()
+    chk_criterion_2_simple_query_two_statements()
+    println("SESSION CHECKS OK (21 groups)")
+}

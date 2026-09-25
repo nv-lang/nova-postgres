@@ -40,7 +40,6 @@ test "criterion 2: simple query, two statements" {
             []PgEvent.new()
         }
     }
-    println("TWOSTMT pre-render len=${evs.len()}")
     assert(evs.len() == 7, "two statements: event count")
     assert(ev(evs[0]) == "rowdesc:1:a:0", "two statements ev0")
     assert(ev(evs[1]) == "row|some:1", "two statements ev1")
