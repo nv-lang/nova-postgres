@@ -1,0 +1,206 @@
+// src/postgres/session_fixtures.nv — shared reference frames and renderers
+// for the Session tests (session_*_test.nv peers). No tests in this file.
+// Shared note for the session_*_test.nv peers: the merged per-test binary
+// of this package miscompiles several constructs that are fine in a normal
+// build — match arms whose variant name exists on two enums vanish silently,
+// big records scramble when returned from helpers, vec-of-record indexing
+// reads wrong fields. These tests therefore use only []u8-in-local helpers
+// and str-returning transcripts; no records or enums cross function
+// boundaries. See repro-local/*.nv and the hand-over for the filed repros.
+
+module postgres
+
+// ──────────────────────────────────────────────────────────────────────────
+// Byte helpers for assembling reference frames (all []u8 in locals)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn cat(a []u8, b []u8) -> []u8 {
+    mut o []u8 = []u8.new(cap: a.len() + b.len())
+    o.append(a)
+    o.append(b)
+    o
+}
+
+fn cat3(a []u8, b []u8, c []u8) -> []u8 =>
+    cat(cat(a, b), c)
+
+fn cat4(a []u8, b []u8, c []u8, d []u8) -> []u8 =>
+    cat(cat(a, b), cat(c, d))
+
+fn cstr(s str) -> []u8 {
+    mut o = s.bytes()
+    o.push(0)
+    o
+}
+
+fn u8byte(v int) -> []u8 {
+    mut b = []u8.new()
+    b.push(v as u8)
+    b
+}
+
+fn i32be(v int) -> []u8 {
+    mut b = []u8.new()
+    b.push(((v >> 24) & 0xFF) as u8)
+    b.push(((v >> 16) & 0xFF) as u8)
+    b.push(((v >> 8) & 0xFF) as u8)
+    b.push((v & 0xFF) as u8)
+    b
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Reference server frames (tag + documented payload)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn auth_ok() -> []u8 =>
+    frame('R' as u8, x"00 00 00 00")
+
+fn auth_cleartext() -> []u8 =>
+    frame('R' as u8, x"00 00 00 03")
+
+// MD5 with the D8a reference salt 01 02 03 04.
+fn auth_md5() -> []u8 =>
+    frame('R' as u8, x"00 00 00 05 01 02 03 04")
+
+fn auth_sasl() -> []u8 =>
+    frame('R' as u8, cat3(x"00 00 00 0A", cstr("SCRAM-SHA-256"), x"00"))
+
+fn sasl_continue(data str) -> []u8 =>
+    frame('R' as u8, cat(x"00 00 00 0B", data.bytes()))
+
+fn sasl_final(data str) -> []u8 =>
+    frame('R' as u8, cat(x"00 00 00 0C", data.bytes()))
+
+fn param_status(name str, value str) -> []u8 =>
+    frame('S' as u8, cat(cstr(name), cstr(value)))
+
+fn backend_key() -> []u8 =>
+    frame('K' as u8, x"00 00 30 39 00 01 09 32")
+
+fn ready(status u8) -> []u8 =>
+    frame('Z' as u8, u8byte(status as int))
+
+// One int4 column named `name`, format 0.
+fn row_desc(name str) -> []u8 =>
+    frame('T' as u8, cat3(x"00 01", cstr(name), x"00 00 00 00 00 00 00 00 00 17 00 04 FF FF FF FF 00 00"))
+
+// Two columns, both binary int4.
+fn row_desc_bin2(n1 str, n2 str) -> []u8 {
+    ro field = x"00 00 00 00 00 00 00 00 00 17 00 04 FF FF FF FF 00 01"
+    frame('T' as u8, cat4(x"00 02", cstr(n1), field, cat(cstr(n2), field)))
+}
+
+fn data_row_text(v str) -> []u8 =>
+    frame('D' as u8, cat(x"00 01", cat(i32be(v.byte_len()), v.bytes())))
+
+// Two-column row: first value raw bytes, second SQL NULL.
+fn data_row_bin_null(b []u8) -> []u8 =>
+    frame('D' as u8, cat(x"00 02", cat(i32be(b.len()), cat(b, x"FF FF FF FF"))))
+
+fn cmd_complete(tag str) -> []u8 =>
+    frame('C' as u8, cstr(tag))
+
+fn error_response(sqlstate str, msg str) -> []u8 {
+    ro fields = cat(x"53", cat(cstr("ERROR"), cat(x"43", cat(cstr(sqlstate), cat(x"4D", cat(cstr(msg), x"00"))))))
+    frame('E' as u8, fields)
+}
+
+fn notice_response(msg str) -> []u8 {
+    ro fields = cat(x"53", cat(cstr("NOTICE"), cat(x"4D", cat(cstr(msg), x"00"))))
+    frame('N' as u8, fields)
+}
+
+fn empty_query() -> []u8 =>
+    frame('I' as u8, x"")
+
+fn parse_complete() -> []u8 =>
+    frame('1' as u8, x"")
+
+fn bind_complete() -> []u8 =>
+    frame('2' as u8, x"")
+
+// ──────────────────────────────────────────────────────────────────────────
+// Reference client frames
+// ──────────────────────────────────────────────────────────────────────────
+
+// StartupMessage for user=postgres, database=postgres.
+fn startup_ref() -> []u8 =>
+    x"00 00 00 29 00 03 00 00 75 73 65 72 00 70 6F 73 74 67 72 65 73 00 64 61 74 61 62 61 73 65 00 70 6F 73 74 67 72 65 73 00 00"
+
+// StartupMessage for user=user, database=db (the SCRAM dialog's identity).
+fn startup_ref_user() -> []u8 =>
+    x"00 00 00 1F 00 03 00 00 75 73 65 72 00 75 73 65 72 00 64 61 74 61 62 61 73 65 00 64 62 00 00"
+
+fn password_ref(pw str) -> []u8 =>
+    frame('p' as u8, cstr(pw))
+
+// The D8a integrator-verified MD5 vector: user postgres, password secret,
+// salt 01 02 03 04 -> md5bb41a296aab6baccb36ff243a562abff.
+fn md5_password_ref() -> []u8 =>
+    frame('p' as u8, cstr("md5bb41a296aab6baccb36ff243a562abff"))
+
+// The full extended cycle for query_extended("SELECT 42, $1::int", [],
+// [ParamValue.null()], [1]): Parse + Bind (NULL parameter as length -1, one
+// binary result format) + Describe portal + Execute + Sync.
+fn extended_ref() -> []u8 {
+    ro p = cat(x"50 00 00 00 1A 00 53 45 4C 45 43 54 20 34 32 2C 20 24 31 3A 3A 69 6E 74 00 00 00", cat(x"42 00 00 00 12 00 00 00 00 00 01 FF FF FF FF 00 01 00 01", cat(x"44 00 00 00 06 50 00", cat(x"45 00 00 00 09 00 00 00 00 00", x"53 00 00 00 04"))))
+    p
+}
+
+// The same cycle for query_extended("SELECT bogus", [], [], []).
+fn extended_ref_bogus() -> []u8 {
+    ro p = cat(x"50 00 00 00 14 00 53 45 4C 45 43 54 20 62 6F 67 75 73 00 00 00", cat(x"42 00 00 00 0C 00 00 00 00 00 00 00 00", cat(x"44 00 00 00 06 50 00", cat(x"45 00 00 00 09 00 00 00 00 00", x"53 00 00 00 04"))))
+    p
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Event rendering — transcripts compare rendered events as strings
+// ──────────────────────────────────────────────────────────────────────────
+
+fn ev(e PgEvent) -> str =>
+    match e {
+        Authenticated => "authenticated"
+        Parameter { name, value } => "ps:${name}=${value}"
+        BackendKey { process_id, secret_key } => "key:${process_id}:${secret_key}"
+        Ready { status } => "ready:${(status as int).to_char() ?? '?'}"
+        RowDesc { fields } => "rowdesc:${fields.len()}:${fields[0].name}:${fields[0].format}"
+        Row { values } => row_render(values)
+        Command { tag } => "cc:${tag}"
+        EmptyQuery => "empty"
+        Notice { fields } => "notice:${error_message(fields)}"
+        QueryError { sqlstate, fields } => "error:${sqlstate}:${error_message(fields)}"
+    }
+
+fn row_render(values []ParamValue) -> str {
+    mut parts []str = []str.new(cap: values.len())
+    mut i = 0
+    while i < values.len() {
+        match values[i].data {
+            Some(b) => {
+                ro s = match b.to_str() {
+                    Ok(t) => "some:${t}"
+                    Err(_) => "some:bin:${b.len()}"
+                }
+                parts.push(s)
+            }
+            None => parts.push("null")
+        }
+        i += 1
+    }
+    mut out = "row"
+    for p in parts {
+        out = "${out}|${p}"
+    }
+    out
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Criterion 2, dialog by dialog. Each dialog has: a reference test (events,
+// client bytes) and a cut test (the same server stream fed whole vs split at
+// every cut point yields the same transcript).
+// ──────────────────────────────────────────────────────────────────────────
+
+// trust entry
+fn trust_server() -> []u8 =>
+    cat4(auth_ok(), param_status("server_version", "15.0"), backend_key(), ready('I' as u8))
+

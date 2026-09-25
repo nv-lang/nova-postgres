@@ -1,0 +1,789 @@
+// src/postgres/session_cuts_test.nv — §Д8б criterion 2, second half of the
+// cut property: every remaining dialog fed with one of its server feeds
+// split at every point yields the same transcript as the whole dialog.
+// Shapes: see session_fixtures.nv. A consume Session lives entirely inside
+// one runner fn — born, stepped, closed — and never crosses a boundary.
+
+module postgres
+
+// Render an event list to the transcript form.
+fn render(evs []PgEvent) -> str {
+    mut out = ""
+    mut i = 0
+    while i < evs.len() {
+        out = "${out};${ev(evs[i])}"
+        i += 1
+    }
+    out
+}
+
+
+fn cleartext_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = auth_cleartext()
+    ro step1 = cat(auth_ok(), ready('I' as u8))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_0() -> () {
+    ro whole = cleartext_run(-1, -1)
+    ro step0 = auth_cleartext()
+    mut cut = 1
+    while cut < step0.len() {
+        assert(cleartext_run(0, cut) == whole, "cleartext step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step1.len() {
+        assert(cleartext_run(1, cut) == whole, "cleartext step1 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn md5_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "secret", "postgres", "n")
+    ro step0 = auth_md5()
+    ro step1 = cat(auth_ok(), ready('I' as u8))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_1() -> () {
+    ro whole = md5_run(-1, -1)
+    ro step0 = auth_md5()
+    mut cut = 1
+    while cut < step0.len() {
+        assert(md5_run(0, cut) == whole, "md5 step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step1.len() {
+        assert(md5_run(1, cut) == whole, "md5 step1 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn wrong_password_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = auth_cleartext()
+    ro step1 = error_response("28P01", "password authentication failed for user postgres")
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_2() -> () {
+    ro whole = wrong_password_run(-1, -1)
+    ro step0 = auth_cleartext()
+    mut cut = 1
+    while cut < step0.len() {
+        assert(wrong_password_run(0, cut) == whole, "wrong_password step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = error_response("28P01", "password authentication failed for user postgres")
+    mut cut = 1
+    while cut < step1.len() {
+        assert(wrong_password_run(1, cut) == whole, "wrong_password step1 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn empty_query_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    ro step1 = cat(empty_query(), ready('I' as u8))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    match s.query("   ") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_3() -> () {
+    ro whole = empty_query_run(-1, -1)
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step0.len() {
+        assert(empty_query_run(0, cut) == whole, "empty_query step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = cat(empty_query(), ready('I' as u8))
+    mut cut = 1
+    while cut < step1.len() {
+        assert(empty_query_run(1, cut) == whole, "empty_query step1 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn notice_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    ro step1 = cat3(notice_response("index blah does not exist"), cat3(row_desc("a"), data_row_text("1"), cmd_complete("SELECT 1")), ready('I' as u8))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_4() -> () {
+    ro whole = notice_run(-1, -1)
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step0.len() {
+        assert(notice_run(0, cut) == whole, "notice step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = cat3(notice_response("index blah does not exist"), cat3(row_desc("a"), data_row_text("1"), cmd_complete("SELECT 1")), ready('I' as u8))
+    mut cut = 1
+    while cut < step1.len() {
+        assert(notice_run(1, cut) == whole, "notice step1 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn scram_run(split_step int, cut int) -> str {
+    ro server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1"
+    consume s = Session.new("user", "pencil", "db", "rOprNGfwEbeRWgbNEkqO")
+    ro step0 = auth_sasl()
+    ro step1 = sasl_continue(server_first)
+    ro step2 = sasl_final("v=XjTu3KBABgY/OKnhaQwxJb9Vbt2Fj1v+lPuMzeAcqSk=")
+    ro step3 = cat(auth_ok(), ready('I' as u8))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 2 && cut >= 0 {
+        mut all = match s.feed(step2[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step2[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step2) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 3 && cut >= 0 {
+        mut all = match s.feed(step3[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step3[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step3) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+test "criterion 2 cut: scram entry survives every cut" {
+    ro whole = scram_run(-1, -1)
+    ro server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1"
+    ro step0 = auth_sasl()
+    mut cut = 1
+    while cut < step0.len() {
+        assert(scram_run(0, cut) == whole, "scram step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = sasl_continue(server_first)
+    mut cut = 1
+    while cut < step1.len() {
+        assert(scram_run(1, cut) == whole, "scram step1 cut ${cut}")
+        cut += 1
+    }
+    ro step2 = sasl_final("v=XjTu3KBABgY/OKnhaQwxJb9Vbt2Fj1v+lPuMzeAcqSk=")
+    mut cut = 1
+    while cut < step2.len() {
+        assert(scram_run(2, cut) == whole, "scram step2 cut ${cut}")
+        cut += 1
+    }
+    ro step3 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step3.len() {
+        assert(scram_run(3, cut) == whole, "scram step3 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn ext_error_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    ro step1 = cat3(parse_complete(), error_response("42601", "syntax error"), ready('I' as u8))
+    ro step2 = cat3(row_desc("a"), data_row_text("7"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    match s.query_extended("SELECT bogus", [], [], []) {
+        Ok(()) => ()
+        Err(e) => assert(false, "extended query errored: ${e}")
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    if split_step == 2 && cut >= 0 {
+        mut all = match s.feed(step2[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step2[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step2) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_5() -> () {
+    ro whole = ext_error_run(-1, -1)
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step0.len() {
+        assert(ext_error_run(0, cut) == whole, "ext_error step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = cat3(parse_complete(), error_response("42601", "syntax error"), ready('I' as u8))
+    mut cut = 1
+    while cut < step1.len() {
+        assert(ext_error_run(1, cut) == whole, "ext_error step1 cut ${cut}")
+        cut += 1
+    }
+    ro step2 = cat3(row_desc("a"), data_row_text("7"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    mut cut = 1
+    while cut < step2.len() {
+        assert(ext_error_run(2, cut) == whole, "ext_error step2 cut ${cut}")
+        cut += 1
+    }
+}
+
+fn ps_run(split_step int, cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    ro step1 = param_status("application_name", "myapp")
+    ro step2 = cat3(row_desc("a"), data_row_text("1"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    mut out = ""
+    if split_step == 0 && cut >= 0 {
+        mut all = match s.feed(step0[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step0[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step0) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    if split_step == 1 && cut >= 0 {
+        mut all = match s.feed(step1[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step1[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step1) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    if split_step == 2 && cut >= 0 {
+        mut all = match s.feed(step2[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(step2[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = "${out}${render(all)}"
+    } else {
+        match s.feed(step2) {
+            Ok(evs) => { out = "${out}${render(evs)}" }
+            Err(e) => {
+                s.close()
+                return "${out}!${e}"
+            }
+        }
+    }
+    s.close()
+    out
+}
+
+fn fntmp_6() -> () {
+    ro whole = ps_run(-1, -1)
+    ro step0 = cat(auth_ok(), ready('I' as u8))
+    mut cut = 1
+    while cut < step0.len() {
+        assert(ps_run(0, cut) == whole, "ps step0 cut ${cut}")
+        cut += 1
+    }
+    ro step1 = param_status("application_name", "myapp")
+    mut cut = 1
+    while cut < step1.len() {
+        assert(ps_run(1, cut) == whole, "ps step1 cut ${cut}")
+        cut += 1
+    }
+    ro step2 = cat3(row_desc("a"), data_row_text("1"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    mut cut = 1
+    while cut < step2.len() {
+        assert(ps_run(2, cut) == whole, "ps step2 cut ${cut}")
+        cut += 1
+    }
+}

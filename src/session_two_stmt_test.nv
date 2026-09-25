@@ -1,0 +1,56 @@
+// src/postgres/session_query_test.nv — §Д8б criterion 2: the query dialogs
+// (two statements, empty, error recovery, extended, notice, parameter
+// status), each also fed cut at every point.
+// Shared note for the session_*_test.nv peers: the merged per-test binary
+// of this package miscompiles several constructs that are fine in a normal
+// build — match arms whose variant name exists on two enums vanish silently,
+// big records scramble when returned from helpers, vec-of-record indexing
+// reads wrong fields. These tests therefore use only []u8-in-local helpers
+// and str-returning transcripts; no records or enums cross function
+// boundaries. See repro-local/*.nv and the hand-over for the filed repros.
+
+module postgres
+
+// simple query with two statements
+fn two_stmt_server() -> []u8 {
+    ro rows = cat3(row_desc("a"), data_row_text("1"), cmd_complete("SELECT 1"))
+    ro rows2 = cat3(row_desc("b"), data_row_text("2"), cmd_complete("SELECT 2"))
+    cat(cat(rows, rows2), ready('I' as u8))
+}
+
+test "criterion 2: simple query, two statements" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "two statements: entry events")
+    match s.query("SELECT 1; SELECT 2") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro evs = match s.feed(two_stmt_server()) {
+        Ok(e) => e
+        Err(e) => {
+            println("TWOSTMT rows err: ${e}")
+            assert(false, "rows errored")
+            []PgEvent.new()
+        }
+    }
+    println("TWOSTMT pre-render len=${evs.len()}")
+    assert(evs.len() == 7, "two statements: event count")
+    assert(ev(evs[0]) == "rowdesc:1:a:0", "two statements ev0")
+    assert(ev(evs[1]) == "row|some:1", "two statements ev1")
+    assert(ev(evs[2]) == "cc:SELECT 1", "two statements ev2")
+    assert(ev(evs[3]) == "rowdesc:1:b:0", "two statements ev3")
+    assert(ev(evs[4]) == "row|some:2", "two statements ev4")
+    assert(ev(evs[5]) == "cc:SELECT 2", "two statements ev5")
+    assert(ev(evs[6]) == "ready:I", "two statements ev6")
+    assert(s.drain() == cat(startup_ref(), frame('Q' as u8, cstr("SELECT 1; SELECT 2"))), "two statements: client bytes")
+    s.close()
+}
+
+

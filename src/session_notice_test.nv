@@ -1,0 +1,45 @@
+// src/postgres/session_query_test.nv — §Д8б criterion 2: the query dialogs
+// (two statements, empty, error recovery, extended, notice, parameter
+// status), each also fed cut at every point.
+// Shared note for the session_*_test.nv peers: the merged per-test binary
+// of this package miscompiles several constructs that are fine in a normal
+// build — match arms whose variant name exists on two enums vanish silently,
+// big records scramble when returned from helpers, vec-of-record indexing
+// reads wrong fields. These tests therefore use only []u8-in-local helpers
+// and str-returning transcripts; no records or enums cross function
+// boundaries. See repro-local/*.nv and the hand-over for the filed repros.
+
+module postgres
+
+// NoticeResponse mid query
+test "criterion 2: notice mid query" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "notice: entry events")
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro server = cat3(notice_response("index blah does not exist"), cat3(row_desc("a"), data_row_text("1"), cmd_complete("SELECT 1")), ready('I' as u8))
+    ro evs = match s.feed(server) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "notice round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 5, "notice: event count")
+    assert(ev(evs[0]) == "notice:index blah does not exist", "notice ev0")
+    assert(ev(evs[1]) == "rowdesc:1:a:0", "notice ev1")
+    assert(ev(evs[2]) == "row|some:1", "notice ev2")
+    assert(ev(evs[3]) == "cc:SELECT 1", "notice ev3")
+    assert(ev(evs[4]) == "ready:I", "notice ev4")
+    s.close()
+}
+

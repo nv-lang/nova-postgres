@@ -1,0 +1,127 @@
+// src/postgres/session_query_test.nv — §Д8б criterion 2: the query dialogs
+// (two statements, empty, error recovery, extended, notice, parameter
+// status), each also fed cut at every point.
+// Shared note for the session_*_test.nv peers: the merged per-test binary
+// of this package miscompiles several constructs that are fine in a normal
+// build — match arms whose variant name exists on two enums vanish silently,
+// big records scramble when returned from helpers, vec-of-record indexing
+// reads wrong fields. These tests therefore use only []u8-in-local helpers
+// and str-returning transcripts; no records or enums cross function
+// boundaries. See repro-local/*.nv and the hand-over for the filed repros.
+
+module postgres
+
+// error mid simple query and recovery on ReadyForQuery
+fn recovery_server() -> []u8 =>
+    cat3(row_desc("a"), error_response("42601", "syntax error"), ready('I' as u8))
+
+test "criterion 2: error mid simple query and recovery" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "recovery: entry events")
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    // The error lands after a RowDescription; the DataRow the server would
+    // have sent is skipped together with everything up to ReadyForQuery.
+    ro evs = match s.feed(recovery_server()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "error round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 3, "recovery: event count")
+    assert(ev(evs[0]) == "rowdesc:1:a:0", "recovery ev0")
+    assert(ev(evs[1]) == "error:42601:syntax error", "recovery ev1")
+    assert(ev(evs[2]) == "ready:I", "recovery ev2")
+    // The session is Ready again and runs the next query.
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "second query errored: ${e}")
+    }
+    ro ok_rows = cat3(row_desc("a"), data_row_text("9"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    ro evs2 = match s.feed(ok_rows) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "recovery round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 4, "recovery: second round events")
+    assert(ev(evs2[0]) == "rowdesc:1:a:0", "recovery ev2-0")
+    assert(ev(evs2[1]) == "row|some:9", "recovery ev2-1")
+    assert(ev(evs2[2]) == "cc:SELECT 1", "recovery ev2-2")
+    assert(ev(evs2[3]) == "ready:I", "recovery ev2-3")
+    ro want = cat(startup_ref(), frame('Q' as u8, cstr("SELECT 1")))
+    assert(s.drain() == cat(want, frame('Q' as u8, cstr("SELECT 1"))), "recovery: client bytes")
+    s.close()
+}
+
+test "criterion 2 cut: error recovery survives every cut" {
+    ro whole = feed_recovery(-1)
+    mut cut = 1
+    while cut < recovery_server().len() {
+        assert(feed_recovery(cut) == whole, "recovery cut at ${cut}")
+        cut += 1
+    }
+}
+
+fn feed_recovery(cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro _e = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro server = recovery_server()
+    ro evs = if cut < 0 {
+        match s.feed(server) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+    } else {
+        mut all = match s.feed(server[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+        match s.feed(server[cut..]) {
+            Ok(e2) => {
+                all.append(e2)
+                all
+            }
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+    }
+    mut out = ""
+    mut i = 0
+    while i < evs.len() {
+        out = "${out};${ev(evs[i])}"
+        i += 1
+    }
+    s.close()
+    out
+}
+

@@ -1,0 +1,184 @@
+// src/postgres/session_rules_test.nv — §Д8б criteria 3 and 4: illegal
+// transitions, transaction status, close.
+// Shared note for the session_*_test.nv peers: the merged per-test binary
+// of this package miscompiles several constructs that are fine in a normal
+// build — match arms whose variant name exists on two enums vanish silently,
+// big records scramble when returned from helpers, vec-of-record indexing
+// reads wrong fields. These tests therefore use only []u8-in-local helpers
+// and str-returning transcripts; no records or enums cross function
+// boundaries. See repro-local/*.nv and the hand-over for the filed repros.
+
+module postgres
+
+// ──────────────────────────────────────────────────────────────────────────
+// Criterion 3: illegal transitions are structural errors, never panics
+// ──────────────────────────────────────────────────────────────────────────
+
+test "criterion 3: DataRow before RowDescription is a protocol error" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "entry events")
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro e = match s.feed(data_row_text("1")) {
+        Ok(_) => {
+            assert(false, "DataRow before RowDescription decoded fine")
+            PostgresError { kind: Protocol { what: "unreachable" } }
+        }
+        Err(e) => e
+    }
+    match e.kind {
+        Protocol { what } => assert(what == "DataRow before RowDescription", "wrong message")
+        _ => assert(false, "wrong error kind")
+    }
+    s.close()
+}
+
+test "criterion 3: ReadyForQuery during authentication is a protocol error" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e = match s.feed(ready('I' as u8)) {
+        Ok(_) => {
+            assert(false, "ReadyForQuery during authentication accepted")
+            PostgresError { kind: Protocol { what: "unreachable" } }
+        }
+        Err(e) => e
+    }
+    match e.kind {
+        Protocol { what } => assert(what == "ReadyForQuery during authentication", "wrong message")
+        _ => assert(false, "wrong error kind")
+    }
+    s.close()
+}
+
+test "criterion 3: query message while idle is a protocol error" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "entry events")
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    // Finish the query properly, then send CommandComplete with no query in
+    // flight.
+    ro evs2 = match s.feed(cat3(row_desc("a"), data_row_text("1"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))) {
+        Ok(e) => e
+        Err(e) => {
+            println("IDLE round err ${e}")
+            assert(false, "query round errored")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 4, "query round events")
+    ro e = match s.feed(cmd_complete("SELECT 1")) {
+        Ok(_) => {
+            assert(false, "CommandComplete while idle accepted")
+            PostgresError { kind: Protocol { what: "unreachable" } }
+        }
+        Err(e) => e
+    }
+    match e.kind {
+        Protocol { what } => assert(what == "CommandComplete outside a query", "wrong message")
+        _ => assert(false, "wrong error kind")
+    }
+    s.close()
+}
+
+test "criterion 3: a failed session refuses further feeds" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    match s.feed(ready('I' as u8)) {
+        Ok(_) => assert(false, "ReadyForQuery during authentication accepted")
+        Err(_) => ()
+    }
+    match s.feed(auth_ok()) {
+        Ok(_) => assert(false, "feed on failed session accepted")
+        Err(_) => ()
+    }
+    s.close()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Criterion 4: the transaction status from ReadyForQuery
+// ──────────────────────────────────────────────────────────────────────────
+
+test "criterion 4: BEGIN -> T, error inside -> E, ROLLBACK -> I" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "txn: entry events")
+    match s.query("BEGIN") {
+        Ok(()) => ()
+        Err(e) => assert(false, "BEGIN errored: ${e}")
+    }
+    ro evs = match s.feed(cat(cmd_complete("BEGIN"), ready('T' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "BEGIN round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 2, "txn: BEGIN events")
+    assert(s.transaction_status() == 'T' as u8, "status after BEGIN")
+    match s.query("SELECT bogus") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro evs2 = match s.feed(cat(error_response("42601", "syntax error"), ready('E' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "error round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 2, "txn: error events")
+    assert(s.transaction_status() == 'E' as u8, "status after error inside transaction")
+    match s.query("ROLLBACK") {
+        Ok(()) => ()
+        Err(e) => assert(false, "ROLLBACK errored: ${e}")
+    }
+    ro evs3 = match s.feed(cat(cmd_complete("ROLLBACK"), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "ROLLBACK round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs3.len() == 2, "txn: ROLLBACK events")
+    assert(s.transaction_status() == 'I' as u8, "status after ROLLBACK")
+    s.close()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Close
+// ──────────────────────────────────────────────────────────────────────────
+
+test "close returns the final flush with Terminate" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro startup = s.drain()
+    assert(startup == startup_ref(), "startup bytes before close")
+    // Consume: the session ends here. Further feeds are refused by the
+    // type system, not by a runtime check.
+    ro fin = s.close()
+    assert(fin == ClientMessage.terminate(), "Terminate not in the final flush")
+}
+
+
+// freeze-marker-1

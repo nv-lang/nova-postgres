@@ -1,0 +1,107 @@
+// src/postgres/session_extended_test.nv — §Д8б criterion 2: the extended
+// query with a NULL parameter and a binary result column, plus the dialog
+// fed cut at every point. Shapes: see session_fixtures.nv (linear, no
+// records or enums cross function boundaries).
+
+module postgres
+
+// ParseComplete, BindComplete, RowDescription (two binary int4 columns),
+// DataRow (binary 42, NULL), CommandComplete, ReadyForQuery.
+fn extended_server() -> []u8 =>
+    cat4(parse_complete(), bind_complete(), row_desc_bin2("?column?", "?column?"), cat(data_row_bin_null(x"00 00 00 80"), cat(cmd_complete("SELECT 1"), ready('I' as u8))))
+
+test "criterion 2: extended query with NULL parameter and binary result column" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "extended: entry events")
+    // Built by push, not a vec literal: a record carrying Option[[]u8]
+    // inside a vec literal is the none_slice_lower defect shape.
+    mut ps []ParamValue = []ParamValue.new()
+    ps.push(ParamValue.null())
+    match s.query_extended("SELECT 42, $1::int", [], ps, [1]) {
+        Ok(()) => ()
+        Err(e) => assert(false, "extended query errored: ${e}")
+    }
+    ro evs = match s.feed(extended_server()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "extended round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 4, "extended: event count")
+    assert(ev(evs[0]) == "rowdesc:2:?column?:1", "extended ev0")
+    assert(ev(evs[1]) == "row|some:bin:4|null", "extended ev1")
+    assert(ev(evs[2]) == "cc:SELECT 1", "extended ev2")
+    assert(ev(evs[3]) == "ready:I", "extended ev3")
+    assert(s.drain() == cat(startup_ref(), extended_ref()), "extended: client bytes")
+    s.close()
+}
+
+test "criterion 2 cut: extended query survives every cut" {
+    ro whole = feed_extended(-1)
+    mut cut = 1
+    while cut < extended_server().len() {
+        assert(feed_extended(cut) == whole, "extended cut at ${cut}")
+        cut += 1
+    }
+}
+
+fn feed_extended(cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro _e = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    mut ps []ParamValue = []ParamValue.new()
+    ps.push(ParamValue.null())
+    match s.query_extended("SELECT 42, $1::int", [], ps, [1]) {
+        Ok(()) => ()
+        Err(e) => assert(false, "extended query errored: ${e}")
+    }
+    ro server = extended_server()
+    ro evs = if cut < 0 {
+        match s.feed(server) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+    } else {
+        mut all = match s.feed(server[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+        match s.feed(server[cut..]) {
+            Ok(e2) => {
+                all.append(e2)
+                all
+            }
+            Err(e) => {
+                s.close()
+                return "ERR:${e}"
+            }
+        }
+    }
+    mut out = ""
+    mut i = 0
+    while i < evs.len() {
+        out = "${out};${ev(evs[i])}"
+        i += 1
+    }
+    s.close()
+    out
+}

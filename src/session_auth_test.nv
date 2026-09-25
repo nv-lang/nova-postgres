@@ -1,0 +1,153 @@
+// src/postgres/session_auth_test.nv — §Д8б criterion 2: the authentication
+// dialogs (trust, cleartext, MD5, SCRAM, wrong password) and the trust cut.
+// Shared note for the session_*_test.nv peers: the merged per-test binary
+// of this package miscompiles several constructs that are fine in a normal
+// build — match arms whose variant name exists on two enums vanish silently,
+// big records scramble when returned from helpers, vec-of-record indexing
+// reads wrong fields. These tests therefore use only []u8-in-local helpers
+// and str-returning transcripts; no records or enums cross function
+// boundaries. See repro-local/*.nv and the hand-over for the filed repros.
+
+module postgres
+
+test "criterion 2: trust entry dialog" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro evs = match s.feed(trust_server()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "feed errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 4, "trust: event count")
+    assert(ev(evs[0]) == "authenticated", "trust ev0")
+    assert(ev(evs[1]) == "ps:server_version=15.0", "trust ev1")
+    assert(ev(evs[2]) == "key:12345:67890", "trust ev2")
+    assert(ev(evs[3]) == "ready:I", "trust ev3")
+    assert(s.drain() == startup_ref(), "trust: client bytes")
+    s.close()
+}
+
+// cut == -1 feeds the whole stream; otherwise feeds server[..cut] then
+// server[cut..]. Returns the rendered transcript.
+
+// cleartext entry
+test "criterion 2: cleartext entry dialog" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro evs1 = match s.feed(auth_cleartext()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "cleartext request errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs1.len() == 0, "cleartext: no events yet")
+    ro evs2 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "cleartext finish errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 2, "cleartext: event count")
+    assert(ev(evs2[0]) == "authenticated", "cleartext ev0")
+    assert(ev(evs2[1]) == "ready:I", "cleartext ev1")
+    assert(s.drain() == cat(startup_ref(), password_ref("smoke")), "cleartext: client bytes")
+    s.close()
+}
+
+// MD5 entry — password "secret" hits the D8a integrator-verified vector.
+test "criterion 2: md5 entry dialog" {
+    consume s = Session.new("postgres", "secret", "postgres", "n")
+    ro evs1 = match s.feed(auth_md5()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "md5 request errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs1.len() == 0, "md5: no events yet")
+    ro evs2 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "md5 finish errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 2, "md5: event count")
+    assert(ev(evs2[0]) == "authenticated", "md5 ev0")
+    assert(ev(evs2[1]) == "ready:I", "md5 ev1")
+    assert(s.drain() == cat(startup_ref(), md5_password_ref()), "md5: client bytes")
+    s.close()
+}
+
+// SCRAM entry — the RFC 7677 §3 exchange, verbatim.
+test "criterion 2: scram entry dialog" {
+    // RFC 7677 §3, same vectors as scram_test.nv.
+    ro server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    ro client_first = "n,,n=user,r=rOprNGfwEbeRWgbNEkqO"
+    ro client_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+    ro initial_ref = frame('p' as u8, cat(cstr("SCRAM-SHA-256"), cat(i32be(client_first.byte_len()), client_first.bytes())))
+    consume s = Session.new("user", "pencil", "db", "rOprNGfwEbeRWgbNEkqO")
+    ro e1 = match s.feed(auth_sasl()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "sasl request errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 0, "scram: no events yet")
+    ro e2 = match s.feed(sasl_continue(server_first)) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "sasl continue errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e2.len() == 0, "scram: still no events")
+    ro e3 = match s.feed(sasl_final("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "sasl final errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e3.len() == 0, "scram: signature accepted quietly")
+    ro e4 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "scram finish errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e4.len() == 2, "scram: event count")
+    assert(ev(e4[0]) == "authenticated", "scram ev0")
+    assert(ev(e4[1]) == "ready:I", "scram ev1")
+    ro want = cat(startup_ref_user(), cat(initial_ref, frame('p' as u8, client_final.bytes())))
+    assert(s.drain() == want, "scram: client bytes")
+    s.close()
+}
+
+// wrong password — ErrorResponse with SQLSTATE 28P01 in the auth phase is a
+// structural authentication error.
+test "criterion 2: wrong password is a structural auth error" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro _e1 = match s.feed(auth_cleartext()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "cleartext request errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    ro e = match s.feed(error_response("28P01", "password authentication failed for user postgres")) {
+        Ok(_) => {
+            assert(false, "auth failure accepted")
+            PostgresError { kind: Protocol { what: "unreachable" } }
+        }
+        Err(e) => e
+    }
+    assert(e.to_str() == "authentication failure: server rejected authentication (SQLSTATE 28P01): password authentication failed for user postgres", "wrong password error")
+    assert(s.drain() == cat(startup_ref(), password_ref("smoke")), "wrong password: client bytes")
+    s.close()
+}
+

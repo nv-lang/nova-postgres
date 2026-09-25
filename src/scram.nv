@@ -36,7 +36,11 @@ export type ScramClient {
     ro client_nonce str
     ro client_first_bare str
     mut auth_message str
-    mut server_key [32]u8
+    // Owning vec, not [32]u8: a fixed array inside a record participates in
+    // cross-CU layout disagreement (the [N]T sizing defect family, registry
+    // 221.1 #1325) — ScramClient lives inside Session.scram, and a layout
+    // mismatch scrambles Session's fields for consumers compiled separately.
+    mut server_key []u8
     mut responded bool
 }
 
@@ -50,7 +54,7 @@ export fn ScramClient.new(user str, password str, client_nonce str) -> ScramClie
         client_nonce,
         client_first_bare: bare,
         auth_message: "",
-        server_key: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        server_key: []u8.new(),
         responded: false,
     }
 }
@@ -100,7 +104,9 @@ export fn ScramClient mut @respond_server_first(server_first str) -> Result[str,
     }
 
     @auth_message = auth_message
-    @server_key = HmacSha256.compute(salted[..32], SCRAM_SERVER_KEY_LABEL.bytes())
+    ro sk = HmacSha256.compute(salted[..32], SCRAM_SERVER_KEY_LABEL.bytes())
+    @server_key = []u8.new(cap: 32)
+    @server_key.append(sk[..32])
     @responded = true
     Ok("${client_final_without_proof},p=${Base64.encode(proof[..32])}")
 }
@@ -116,7 +122,7 @@ export fn ScramClient mut @verify_server_final(server_final str) -> Result[(), P
         Ok(b) => b
         Err(_) => return Err(PostgresError { kind: Auth { what: "invalid base64 server signature" } })
     }
-    ro computed = HmacSha256.compute(@server_key[..32], @auth_message.bytes())
+    ro computed = HmacSha256.compute(@server_key, @auth_message.bytes())
     if !constant_time_bytes_eq(expected, computed[..32]) {
         return Err(PostgresError { kind: BadServerSignature })
     }

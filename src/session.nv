@@ -1,6 +1,6 @@
 // src/postgres/session.nv — Session: the connection as a PURE state machine
 // (plan 286 §Д8б). Input: bytes arriving from the server. Output:
-// [`SessionEvent`]s and bytes to send (drained by the caller). Phases:
+// [`PgEvent`]s and bytes to send (drained by the caller). Phases:
 //
 //   Authenticating → Startup → Ready ⇄ (QuerySimple | QueryExtended) → Closed
 //                                                          ↘ Failed
@@ -44,20 +44,20 @@ export type ExtStage enum
 /// arrive raw — `Some(bytes)` in the column's negotiated format (text unless
 /// a binary result format was requested), `None` for SQL NULL. Type codecs
 /// are a later slice; this slice does not interpret bytes.
-export type SessionEvent enum
+export type PgEvent enum
     /// AuthenticationOk: the authentication exchange succeeded;
     /// ParameterStatus/BackendKey/Ready events follow.
     | Authenticated
-    | ParameterStatus { name str, value str }
+    | Parameter { name str, value str }
     /// The backend keys advertised by BackendKeyData; the pair a
     /// CancelRequest frame needs ([`ClientMessage.cancel_request`]).
     | BackendKey { process_id int, secret_key int }
     /// ReadyForQuery; `status` is the transaction-status byte
     /// (`I` idle, `T` in transaction, `E` failed transaction).
     | Ready { status u8 }
-    | RowDescription { fields []RowField }
-    | DataRow { values []Option[[]u8] }
-    | CommandComplete { tag str }
+    | RowDesc { fields []RowField }
+    | Row { values []ParamValue }
+    | Command { tag str }
     /// EmptyQueryResponse: the query string contained only whitespace.
     | EmptyQuery
     /// A NoticeResponse the server interleaved; not fatal.
@@ -70,7 +70,13 @@ export type SessionEvent enum
 /// The connection state machine. Pure: feed bytes in, drain bytes out, read
 /// events off each [`Session @feed`] call. Fields are private to the
 /// exchange — observe through events and the read-only getters.
-export type Session {
+///
+/// A consume type (D131): a session is a single linear state — it is
+/// created once, stepped in place through its `mut @` methods, and must be
+/// ended explicitly with [`Session @close`]. No copy semantics, no aliasing:
+/// a consumer cannot accidentally branch on one session or lose updates in a
+/// helper that took it by value.
+export type Session consume {
     ro user str
     ro password str
     ro database str
@@ -145,26 +151,20 @@ export fn Session mut @query(q str) -> Result[(), PostgresError] {
 
 /// Queue an extended-protocol cycle: Parse (unnamed statement, no declared
 /// parameter types), Bind (unnamed portal, `param_formats`/`result_formats`
-/// as format codes, `None` parameter = SQL NULL), Describe portal, Execute,
-/// Sync. Only legal in `Ready`.
-export fn Session mut @query_extended(sql str, param_formats []int, params []Option[[]u8], result_formats []int) -> Result[(), PostgresError] {
+/// as format codes, [`ParamValue.null`] = SQL NULL), Describe portal,
+/// Execute, Sync. Only legal in `Ready`.
+///
+/// Parameters are []ParamValue, not []Option[[]u8]: Option[[]u8] mislowers
+/// at the C-codegen stage — as a vec element it breaks the build loudly
+/// (repro-local/opt_slice_iter), and inside an enum payload it corrupts the
+/// enum's vec storage silently (repro-local/enum_opt_slice). Inside the
+/// ParamValue record it lowers correctly (unchanged since D8a).
+export fn Session mut @query_extended(sql str, param_formats []int, params []ParamValue, result_formats []int) -> Result[(), PostgresError] {
     if @phase != Ready {
         return Err(PostgresError { kind: Protocol { what: "extended query issued while the session is not ready" } })
     }
-    mut values []ParamValue = []ParamValue.new(cap: params.len())
-    // Index walk, not `for p in params`: iterating []Option[[]u8] with a
-    // for-loop trips a mono-collector C-build defect (repro-local/
-    // opt_slice_iter). Indexed access is not affected.
-    mut i = 0
-    while i < params.len() {
-        match params[i] {
-            Some(bytes) => values.push(ParamValue.binary(bytes))
-            None => values.push(ParamValue.null())
-        }
-        i += 1
-    }
     @outbound.append(ClientMessage.parse("", sql, []))
-    @outbound.append(ClientMessage.bind("", "", param_formats, values, result_formats))
+    @outbound.append(ClientMessage.bind("", "", param_formats, params, result_formats))
     @outbound.append(ClientMessage.describe('P' as u8, ""))
     @outbound.append(ClientMessage.execute("", 0))
     @outbound.append(ClientMessage.sync())
@@ -175,12 +175,19 @@ export fn Session mut @query_extended(sql str, param_formats []int, params []Opt
     Ok(())
 }
 
-/// Queue Terminate and move to `Closed`. A no-op on a failed session.
-export fn Session mut @close() -> () {
+/// Close the session: queue Terminate (unless it has Failed), move to
+/// `Closed`, and return every byte still queued — the final flush for the
+/// connection, in one piece. Consumes the session: the mandatory final
+/// step, enforced by the type system (D133) — a session cannot be dropped
+/// or accidentally reused after closing.
+export fn Session consume @close() -> []u8 {
     if @phase != Failed {
         @outbound.append(ClientMessage.terminate())
         @phase = Closed
     }
+    ro out = @outbound
+    @outbound = []u8.new()
+    out
 }
 
 /// Feed bytes arriving from the server. Decodes every complete message in
@@ -189,27 +196,27 @@ export fn Session mut @close() -> () {
 /// the next call — the exchange survives any chunking. Structural failures
 /// (a bad frame, an illegal transition) move the session to `Failed` and
 /// return `Err`; the session is then unusable.
-export fn Session mut @feed(bytes []u8) -> Result[[]SessionEvent, PostgresError] {
+export fn Session mut @feed(bytes []u8) -> Result[[]PgEvent, PostgresError] {
     if @phase == Closed || @phase == Failed {
         return Err(PostgresError { kind: Protocol { what: "feed on a closed or failed session" } })
     }
     @inbound.append(bytes)
-    mut events []SessionEvent = []SessionEvent.new()
-    while true {
-        match ServerMessage.decode(@inbound) {
+    mut events []PgEvent = []PgEvent.new()
+    // Walk by offset, compacting the buffer once at the end: no allocation
+    // happens in the loop besides the decoder's own, so nothing can move
+    // under the decoded message between decode and dispatch (an allocation
+    // there reads as a dangling tag — observed in the wild as DataRow
+    // dispatching as AuthenticationSaslFinal; see repro-local/session_feed).
+    mut pos = 0
+    while pos < @inbound.len() {
+        match ServerMessage.decode(@inbound[pos..]) {
             Ok(NeedMoreBytes) => break
             Err(e) => {
                 @phase = Failed
                 return Err(e)
             }
             Ok(Message { msg, consumed }) => {
-                // Drop the consumed prefix. Rebinding @inbound to a shorter
-                // slice would not stick (D326 R6: a heap handle is passed as
-                // the handle) — mutate through truncate/append instead.
-                mut rest []u8 = []u8.new(cap: @inbound.len() - consumed)
-                rest.append(@inbound[consumed..])
-                @inbound.truncate(0)
-                @inbound.append(rest)
+                pos += consumed
                 match @dispatch(msg, events) {
                     Ok(()) => {
                         if @phase == Failed { break }
@@ -222,67 +229,81 @@ export fn Session mut @feed(bytes []u8) -> Result[[]SessionEvent, PostgresError]
             }
         }
     }
+    // Drop the consumed prefix. Rebinding @inbound to a shorter slice would
+    // not stick (D326 R6: a heap handle is passed as the handle) — mutate
+    // through truncate/append instead.
+    if pos > 0 {
+        mut rest []u8 = []u8.new(cap: @inbound.len() - pos)
+        rest.append(@inbound[pos..])
+        @inbound.truncate(0)
+        @inbound.append(rest)
+    }
     Ok(events)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Dispatch — one arm per server message; the phase gate lives here
+// Dispatch — one gate per server message. Split into two sequential matches
+// (connection-level messages, then query-progress messages) on purpose: a
+// single 18-arm match on this enum loses arms at the C-codegen stage of a
+// merged compilation unit (observed: exactly 14 of 18 arms emitted, the
+// missing set varying with the source; repro-local/enum_arm_drop). Each
+// match here stays at 11 arms; a `_` arm is always present.
 // ──────────────────────────────────────────────────────────────────────────
 
-fn Session mut @dispatch(msg ServerMessage, mut events []SessionEvent) -> Result[(), PostgresError] {
-    match msg {
+fn Session mut @dispatch(msg ServerMessage, mut events []PgEvent) -> Result[(), PostgresError] {
+    ro r = match msg {
         // Allowed in every phase: the server announces parameters and
         // notices whenever it likes.
-        ParameterStatus { name, value } => events.push(SessionEvent.ParameterStatus { name, value })
-        NoticeResponse { fields } => events.push(Notice { fields })
+        ParameterStatus { name, value } => {
+            events.push(Parameter { name, value })
+            Ok(())
+        }
+        NoticeResponse { fields } => {
+            events.push(Notice { fields })
+            Ok(())
+        }
 
         // ErrorResponse: fatal during authentication, an event mid-query
         // (then skip to ReadyForQuery), fatal outside any exchange.
         // Value-position matches: `return` inside a statement-position match
         // arm mislowers the match slot to the function's Result type and the
         // C build fails (repro-local/match_arm_return).
-        ErrorResponse { fields } => {
-            ro r = match @phase {
-                Authenticating => Err(PostgresError { kind: Auth { what: "server rejected authentication (SQLSTATE ${sqlstate(fields)}): ${error_message(fields)}" } })
-                Startup => {
-                    events.push(QueryError { sqlstate: sqlstate(fields), fields })
-                    @phase = Failed
-                    Ok(())
-                }
-                QuerySimple | QueryExtended => {
-                    if !@in_error {
-                        @in_error = true
-                        events.push(QueryError { sqlstate: sqlstate(fields), fields })
-                    }
-                    Ok(())
-                }
-                Ready => Err(@proto("ErrorResponse while idle"))
-                Closed | Failed => Ok(())
+        ErrorResponse { fields } => match @phase {
+            Authenticating => Err(PostgresError { kind: Auth { what: "server rejected authentication (SQLSTATE ${sqlstate(fields)}): ${error_message(fields)}" } })
+            Startup => {
+                events.push(QueryError { sqlstate: sqlstate(fields), fields })
+                @phase = Failed
+                Ok(())
             }
-            r?
+            QuerySimple | QueryExtended => {
+                if !@in_error {
+                    @in_error = true
+                    events.push(QueryError { sqlstate: sqlstate(fields), fields })
+                }
+                Ok(())
+            }
+            Ready => Err(@proto("ErrorResponse while idle"))
+            Closed | Failed => Ok(())
         }
 
-        ReadyForQuery { status } => {
-            ro r = match @phase {
-                Authenticating => Err(@proto("ReadyForQuery during authentication"))
-                Startup => {
-                    @txn_status = status
-                    @phase = Ready
-                    events.push(Ready { status })
-                    Ok(())
-                }
-                QuerySimple | QueryExtended => {
-                    @txn_status = status
-                    @phase = Ready
-                    @expect_rows = false
-                    @in_error = false
-                    events.push(Ready { status })
-                    Ok(())
-                }
-                Ready => Err(@proto("ReadyForQuery while idle"))
-                Closed | Failed => Ok(())
+        ReadyForQuery { status } => match @phase {
+            Authenticating => Err(@proto("ReadyForQuery during authentication"))
+            Startup => {
+                @txn_status = status
+                @phase = Ready
+                events.push(Ready { status })
+                Ok(())
             }
-            r?
+            QuerySimple | QueryExtended => {
+                @txn_status = status
+                @phase = Ready
+                @expect_rows = false
+                @in_error = false
+                events.push(Ready { status })
+                Ok(())
+            }
+            Ready => Err(@proto("ReadyForQuery while idle"))
+            Closed | Failed => Ok(())
         }
 
         BackendKeyData { process_id, secret_key } => {
@@ -292,6 +313,7 @@ fn Session mut @dispatch(msg ServerMessage, mut events []SessionEvent) -> Result
             @backend_pid = process_id
             @backend_key = secret_key
             events.push(BackendKey { process_id, secret_key })
+            Ok(())
         }
 
         AuthenticationOk => {
@@ -300,18 +322,21 @@ fn Session mut @dispatch(msg ServerMessage, mut events []SessionEvent) -> Result
             }
             @phase = Startup
             events.push(Authenticated)
+            Ok(())
         }
         AuthenticationCleartextPassword => {
             if @phase != Authenticating {
                 return Err(@proto("cleartext password request outside the authentication phase"))
             }
             @outbound.append(ClientMessage.password(@password))
+            Ok(())
         }
         AuthenticationMd5Password { salt } => {
             if @phase != Authenticating {
                 return Err(@proto("MD5 password request outside the authentication phase"))
             }
             @outbound.append(ClientMessage.password(md5_response(@user, @password, salt)))
+            Ok(())
         }
         AuthenticationSasl { mechanisms } => {
             if @phase != Authenticating {
@@ -329,6 +354,7 @@ fn Session mut @dispatch(msg ServerMessage, mut events []SessionEvent) -> Result
             mut client = ScramClient.new(@user, @password, @client_nonce)
             @outbound.append(ClientMessage.sasl_initial("SCRAM-SHA-256", client.client_first().bytes()))
             @scram = Some(client)
+            Ok(())
         }
         AuthenticationSaslContinue { data } => {
             if @phase != Authenticating {
@@ -345,6 +371,7 @@ fn Session mut @dispatch(msg ServerMessage, mut events []SessionEvent) -> Result
             ro client_final = client.respond_server_first(server_first)?
             @scram = Some(client)
             @outbound.append(ClientMessage.sasl_response(client_final.bytes()))
+            Ok(())
         }
         AuthenticationSaslFinal { data } => {
             if @phase != Authenticating {
@@ -358,68 +385,82 @@ fn Session mut @dispatch(msg ServerMessage, mut events []SessionEvent) -> Result
                 Ok(s) => s
                 Err(_) => return Err(PostgresError { kind: Auth { what: "SASL final is not UTF-8" } })
             }
-            ro r = client.verify_server_final(server_final)
+            ro vr = client.verify_server_final(server_final)
             @scram = Some(client)
-            r?
+            vr?
+            Ok(())
         }
 
-        // Everything below is query progress; during error-skip it is
-        // ignored until the ReadyForQuery arm above closes the cycle.
-        RowDescription { fields } => {
+        // Query-progress messages and anything unknown: second match.
+        _ => @dispatch_query(msg, events)
+    }
+    // `r?` as the function tail does not re-wrap the value into Ok at the
+    // C-codegen stage (the Ok payload is returned raw); an explicit tail
+    // does (same class as repro-local/match_arm_return).
+    r?
+    Ok(())
+}
+
+// Second half of dispatch: the query-progress messages (allowed mid-query;
+// skipped while recovering from an error until ReadyForQuery closes the
+// cycle) and the unknown-message fallback. Seven arms + `_`.
+fn Session mut @dispatch_query(msg ServerMessage, mut events []PgEvent) -> Result[(), PostgresError] {
+    ro r = match msg {
+        // During error-skip every query-progress message is ignored until
+        // the ReadyForQuery arm in the first match closes the cycle.
+        RowDescription { .. } => {
             if @in_error { return Ok(()) }
-            match @phase {
-                QuerySimple => {
-                    @expect_rows = true
-                    events.push(RowDescription { fields })
+            if @phase == QueryExtended {
+                if @ext_stage != ExtDescribe {
+                    return Err(@proto("RowDescription out of order in the extended cycle"))
                 }
-                QueryExtended => {
-                    if @ext_stage != ExtDescribe {
-                        return Err(@proto("RowDescription out of order in the extended cycle"))
-                    }
-                    @ext_stage = ExtExecute
-                    @expect_rows = true
-                    events.push(RowDescription { fields })
-                }
-                _ => return Err(@proto("RowDescription outside a query"))
+                @ext_stage = ExtExecute
+            } else if @phase != QuerySimple {
+                return Err(@proto("RowDescription outside a query"))
             }
+            @expect_rows = true
+            events.push(RowDesc { fields: row_fields_of(msg) })
+            Ok(())
         }
-        DataRow { values } => {
+        DataRow { .. } => {
             if @in_error { return Ok(()) }
-            ro allowed = match @phase {
-                QuerySimple => @expect_rows
-                QueryExtended => @ext_stage == ExtExecute && @expect_rows
-                _ => return Err(@proto("DataRow outside a query"))
+            mut allowed = false
+            if @phase == QuerySimple {
+                allowed = @expect_rows
+            } else if @phase == QueryExtended {
+                allowed = @ext_stage == ExtExecute && @expect_rows
+            } else {
+                return Err(@proto("DataRow outside a query"))
             }
             if !allowed {
                 return Err(@proto("DataRow before RowDescription"))
             }
-            events.push(DataRow { values: raw_values(values) })
+            events.push(Row { values: row_values_of(msg) })
+            Ok(())
         }
-        CommandComplete { tag } => {
+        CommandComplete { .. } => {
             if @in_error { return Ok(()) }
-            match @phase {
-                QuerySimple => events.push(CommandComplete { tag })
-                QueryExtended => {
-                    if @ext_stage != ExtExecute {
-                        return Err(@proto("CommandComplete out of order in the extended cycle"))
-                    }
-                    events.push(CommandComplete { tag })
+            if @phase == QueryExtended {
+                if @ext_stage != ExtExecute {
+                    return Err(@proto("CommandComplete out of order in the extended cycle"))
                 }
-                _ => return Err(@proto("CommandComplete outside a query"))
+            } else if @phase != QuerySimple {
+                return Err(@proto("CommandComplete outside a query"))
             }
+            events.push(Command { tag: command_tag_of(msg) })
+            Ok(())
         }
         EmptyQueryResponse => {
             if @in_error { return Ok(()) }
-            match @phase {
-                QuerySimple => events.push(EmptyQuery)
-                QueryExtended => {
-                    if @ext_stage != ExtExecute {
-                        return Err(@proto("EmptyQueryResponse out of order in the extended cycle"))
-                    }
-                    events.push(EmptyQuery)
+            if @phase == QueryExtended {
+                if @ext_stage != ExtExecute {
+                    return Err(@proto("EmptyQueryResponse out of order in the extended cycle"))
                 }
-                _ => return Err(@proto("EmptyQueryResponse outside a query"))
+            } else if @phase != QuerySimple {
+                return Err(@proto("EmptyQueryResponse outside a query"))
             }
+            events.push(EmptyQuery)
+            Ok(())
         }
         ParseComplete => {
             if @in_error { return Ok(()) }
@@ -427,6 +468,7 @@ fn Session mut @dispatch(msg ServerMessage, mut events []SessionEvent) -> Result
                 return Err(@proto("ParseComplete outside the extended parse step"))
             }
             @ext_stage = ExtBind
+            Ok(())
         }
         BindComplete => {
             if @in_error { return Ok(()) }
@@ -434,6 +476,7 @@ fn Session mut @dispatch(msg ServerMessage, mut events []SessionEvent) -> Result
                 return Err(@proto("BindComplete outside the extended bind step"))
             }
             @ext_stage = ExtDescribe
+            Ok(())
         }
         NoData => {
             if @in_error { return Ok(()) }
@@ -441,12 +484,13 @@ fn Session mut @dispatch(msg ServerMessage, mut events []SessionEvent) -> Result
                 return Err(@proto("NoData outside the extended describe step"))
             }
             @ext_stage = ExtExecute
+            Ok(())
         }
+        // Connection-level messages never reach this match (the first match
+        // handles or rejects them); the catch-all keeps it exhaustive.
+        _ => Err(@proto("message re-dispatched"))
     }
-    // Not the tail expression on purpose: a trailing `match` in a function
-    // returning Result gets its slot mis-typed to Result at the C-codegen
-    // stage (repro-local/match_arm_return). The explicit tail keeps the
-    // match in statement position.
+    r?
     Ok(())
 }
 
@@ -478,20 +522,55 @@ fn error_message(fields []ErrorField) -> str {
     ""
 }
 
-// Decode.nv delivers rows as []ParamValue (the Bind-side type); events
-// expose the raw shape. The `None` arm binds through a typed local on
-// purpose: a bare `None` literal pushed into []Option[[]u8] instantiates
-// as Option[int] at the C-codegen stage (repro-local/none_slice_lower).
-fn raw_values(values []ParamValue) -> []Option[[]u8] {
-    mut out []Option[[]u8] = []Option[[]u8].new(cap: values.len())
-    for v in values {
-        match v.data {
-            Some(bytes) => out.push(Some(bytes))
-            None => {
-                ro n Option[[]u8] = None
-                out.push(n)
-            }
-        }
+
+
+// TEMP-DIAG: bisect only, not API. Mirror of PgEvent for repro-local.
+export type SE2 enum
+    | SAuthenticated
+    | SParameterStatus { name str, value str }
+    | SBackendKey { process_id int, secret_key int }
+    | SReady { status u8 }
+    | SRowDescription { fields []RowField }
+    | SDataRow { values []ParamValue }
+    | SCommandComplete { tag str }
+    | SEmptyQuery
+    | SNotice { fields []ErrorField }
+    | SQueryError { sqlstate str, fields []ErrorField }
+
+// TEMP-DIAG: exact copy of PgEvent under a different name.
+export type Event2 enum
+    | Authenticated
+    | Parameter { name str, value str }
+    | BackendKey { process_id int, secret_key int }
+    | Ready { status u8 }
+    | RowDesc { fields []RowField }
+    | Row { values []ParamValue }
+    | Command { tag str }
+    | EmptyQuery
+    | Notice { fields []ErrorField }
+    | QueryError { sqlstate str, fields []ErrorField }
+
+// Payload extractors. The big dispatch match mis-extracts vec payloads from
+// enum values in some merged compilations (garbage handles downstream);
+// small single-purpose matches lower correctly (same class as the dropped
+// arms — repro-local/enum_arm_drop).
+fn row_fields_of(m ServerMessage) -> []RowField {
+    match m {
+        ServerMessage.RowDescription { fields } => fields
+        _ => []RowField.new()
     }
-    out
+}
+
+fn row_values_of(m ServerMessage) -> []ParamValue {
+    match m {
+        ServerMessage.DataRow { values } => values
+        _ => []ParamValue.new()
+    }
+}
+
+fn command_tag_of(m ServerMessage) -> str {
+    match m {
+        ServerMessage.CommandComplete { tag } => tag
+        _ => ""
+    }
 }

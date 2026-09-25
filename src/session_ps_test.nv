@@ -1,0 +1,49 @@
+// src/postgres/session_query_test.nv — §Д8б criterion 2: the query dialogs
+// (two statements, empty, error recovery, extended, notice, parameter
+// status), each also fed cut at every point.
+// Shared note for the session_*_test.nv peers: the merged per-test binary
+// of this package miscompiles several constructs that are fine in a normal
+// build — match arms whose variant name exists on two enums vanish silently,
+// big records scramble when returned from helpers, vec-of-record indexing
+// reads wrong fields. These tests therefore use only []u8-in-local helpers
+// and str-returning transcripts; no records or enums cross function
+// boundaries. See repro-local/*.nv and the hand-over for the filed repros.
+
+module postgres
+
+// ParameterStatus mid session (while idle, outside any query)
+test "criterion 2: parameter status mid session" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "ps mid: entry events")
+    ro evs = match s.feed(param_status("application_name", "myapp")) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "parameter status errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 1, "ps mid: event count")
+    assert(ev(evs[0]) == "ps:application_name=myapp", "ps mid ev0")
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    ro ok_rows = cat3(row_desc("a"), data_row_text("1"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    ro evs2 = match s.feed(ok_rows) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "query round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 4, "ps mid: query events")
+    s.close()
+}
+

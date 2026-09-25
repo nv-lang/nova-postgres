@@ -1,0 +1,61 @@
+// src/postgres/session_query_test.nv — §Д8б criterion 2: the query dialogs
+// (two statements, empty, error recovery, extended, notice, parameter
+// status), each also fed cut at every point.
+// Shared note for the session_*_test.nv peers: the merged per-test binary
+// of this package miscompiles several constructs that are fine in a normal
+// build — match arms whose variant name exists on two enums vanish silently,
+// big records scramble when returned from helpers, vec-of-record indexing
+// reads wrong fields. These tests therefore use only []u8-in-local helpers
+// and str-returning transcripts; no records or enums cross function
+// boundaries. See repro-local/*.nv and the hand-over for the filed repros.
+
+module postgres
+
+// error in extended query and recovery on Sync
+fn ext_error_server() -> []u8 =>
+    cat3(parse_complete(), error_response("42601", "syntax error"), ready('I' as u8))
+
+test "criterion 2: error in extended query and recovery on Sync" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            println("DIAG EXTERR ${e}")
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "ext error: entry events")
+    match s.query_extended("SELECT bogus", [], [], []) {
+        Ok(()) => ()
+        Err(e) => assert(false, "extended query errored: ${e}")
+    }
+    ro evs = match s.feed(ext_error_server()) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "extended error round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 2, "ext error: event count")
+    assert(ev(evs[0]) == "error:42601:syntax error", "ext error ev0")
+    assert(ev(evs[1]) == "ready:I", "ext error ev1")
+    // Recovery: a plain query works afterwards.
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query after error errored: ${e}")
+    }
+    ro ok_rows = cat3(row_desc("a"), data_row_text("7"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
+    ro evs2 = match s.feed(ok_rows) {
+        Ok(e) => e
+        Err(e) => {
+            println("DIAG2 ${e}")
+            assert(false, "errored")
+            []PgEvent.new()
+        }
+    }
+    assert(evs2.len() == 4, "ext error: recovery events")
+    assert(s.drain() == cat(cat(startup_ref(), extended_ref_bogus()), frame('Q' as u8, cstr("SELECT 1"))), "ext error: client bytes")
+    s.close()
+}
+
