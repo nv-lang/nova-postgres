@@ -308,21 +308,25 @@ fn need_i32(mut cur ReadBuffer, what str) -> Result[int, PostgresError] {
 }
 
 // NUL-terminated string (protocol cstring). std ReadBuffer has no cstring
-// read; this walks bytes to the terminator. Unterminated or non-UTF-8 input
-// is a Truncated error, matching the rest of the need_* family.
+// read; this scans the backing buffer for the terminator and converts the
+// slice in place — one copy (to_str) instead of growing an accumulator.
+// Unterminated or non-UTF-8 input is a Truncated error, matching the rest
+// of the need_* family.
 fn ReadBuffer mut @read_cstr(what str) -> Result[str, PostgresError] {
-    mut acc []u8 = []u8.new()
-    while true {
-        match @read_u8() {
-            Ok(0) => break
-            Ok(b) => acc.push(b)
-            Err(_) => return Err(PostgresError { kind: Truncated { what } })
+    ro start = @position()
+    mut i = start
+    while i < @data.len() {
+        if @data[i] == 0 {
+            ro s = match @data[start..i].to_str() {
+                Ok(t) => t
+                Err(_) => return Err(PostgresError { kind: Truncated { what } })
+            }
+            @pos = i + 1
+            return Ok(s)
         }
+        i += 1
     }
-    match acc.to_str() {
-        Ok(s) => Ok(s)
-        Err(_) => Err(PostgresError { kind: Truncated { what } })
-    }
+    Err(PostgresError { kind: Truncated { what } })
 }
 
 fn need_bytes(mut cur ReadBuffer, n int, what str) -> Result[[]u8, PostgresError] {
