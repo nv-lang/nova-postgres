@@ -175,16 +175,13 @@ fn pump_tls(mut stream TlsStream, mut session Session) Net -> Result[[]PgEvent, 
 // the caller's own binding.
 fn tls_handshake(consume stream TcpStream, server_name str, verify VerificationMode, mut tls_name str) Net -> Result[TlsStream, str] {
     ro cfg = ClientConfig.new(server_name).verification(verify)
-    // The handshake takes an rc-shared handle; our copy closes below (the
-    // TlsStream owns the share — the socket outlives our handle).
-    consume ts = match TlsStream.connect(stream.share(), cfg) {
+    // Ownership moves in: on ANY handshake failure connect closes the
+    // socket itself (its consume block cleanup), on success the socket
+    // lives inside the TlsStream. Nothing to share, nothing to close here.
+    consume ts = match TlsStream.connect(stream, cfg) {
         Ok(consume t) => t
-        Err(e) => {
-            stream.close()
-            return Err("tls: ${e}")
-        }
+        Err(e) => return Err("tls: ${e}")
     }
-    stream.close()
     tls_name = match ts.protocol_version() {
         Some(Tls12) => "TLS 1.2"
         Some(Tls13) => "TLS 1.3"
