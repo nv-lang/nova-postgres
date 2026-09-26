@@ -413,7 +413,7 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
     mut count = 0
     mut sum = 0
     for row in conn {
-        sum += to_int(text_at(row, 0)?)?
+        sum += to_int(row.text_at(0)?)?
         count += 1
     }
     match conn.error() {
@@ -428,7 +428,7 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
     conn.query("SELECT 42")?
     mut answer = 0
     for row in conn {
-        answer = to_int(text_at(row, 0)?)?
+        answer = to_int(row.text_at(0)?)?
     }
     match conn.error() {
         Some(e) => return Err(e)
@@ -442,9 +442,11 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
     Ok("multi: 5 rows iterated (sum 15), then SELECT 42 = ${answer} on the same connection")
 }
 
-// A server error (SQLSTATE) through the row stream leaves the connection
-// usable: next() reports 42601 structurally, @close drains to the cycle
-// end and returns the connection, and the next query works.
+// A server error (SQLSTATE) through the row cursor leaves the connection
+// usable: the for-in runs to ReadyForQuery anyway (the error event is
+// remembered, not thrown), error() reports 42601 structurally, and the
+// next query works — an un-drained answer can never desync the protocol:
+// query() drains the previous one implicitly.
 
 
 fn row_stream_error_recovery(host str, port int) Net Random -> Result[str, str] {
@@ -456,25 +458,27 @@ fn row_stream_error_recovery(host str, port int) Net Random -> Result[str, str] 
         Ok(()) => ()
         Err(e) => return Err("query: ${e}")
     }
-    ro _ = conn.next()
+    mut rows = 0
+    for row in conn {
+        rows += 1
+    }
+    if rows != 0 {
+        return Err("a syntax error produced rows")
+    }
     ro sqlstate = match conn.error() {
         Some(ConnError.Server { sqlstate, .. }) => sqlstate
         Some(e) => return Err("wrong error variant: ${e}")
         None => return Err("a syntax error produced no error")
     }
     println("live: row iteration surfaced SQLSTATE ${sqlstate}")
-    // The connection is usable after a server error: skip the rest of the
-    // answer and run the next query on the same connection.
-    match conn.skip_answer() {
-        Ok(()) => ()
-        Err(e) => return Err("skip: ${e}")
-    }
+    // No skip_answer: the for-in above already drained the answer to
+    // ReadyForQuery. The next query runs on the same connection as-is.
     match conn.query("SELECT 1") {
         Ok(()) => ()
         Err(e) => return Err("select 1: ${e}")
     }
     ro one = match conn.next() {
-        Some(row) => match text_at(row, 0) {
+        Some(row) => match row.text_at(0) {
             Ok(s) => s
             Err(e) => return Err("${e}")
         }
@@ -625,7 +629,7 @@ fn plain_ssl_value(consume conn Connection) Net -> Result[str, str] {
     mut got = false
     for row in conn {
         if !got {
-            match text_at(row, 0) {
+            match row.text_at(0) {
                 Ok(t) => {
                     val = t
                     got = true
@@ -640,10 +644,6 @@ fn plain_ssl_value(consume conn Connection) Net -> Result[str, str] {
     match conn.error() {
         Some(e) => return Err("${e}")
         None => ()
-    }
-    match conn.skip_answer() {
-        Ok(()) => ()
-        Err(e) => return Err("${e}")
     }
     match conn.close() {
         Ok(()) => ()

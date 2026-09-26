@@ -53,9 +53,11 @@ the consumer through `nova-tls` (see `examples/live`).
   `conn.query(q)` sends one query, then `for row in conn` / `conn.next()`
   pull the next row at runtime (reading the socket only as far as needed);
   after the loop, `conn.error()` holds the error that ended the iteration
-  (read it if the loop stopped early) and `conn.skip_answer()` drains to
-  ReadyForQuery — so a SQL error (42601 etc.) keeps the connection usable.
-  `text_at(row, i)` decodes one text column. Failures are structured `ConnError`
+  (read it if the loop ended early — a full for-in always runs to
+  ReadyForQuery, even past a server error). An unfinished answer can
+  never desync the protocol: the next query drains it implicitly;
+  `conn.skip_answer()` is the explicit early-exit form. `row.text_at(i)`
+  decodes one text column. Failures are structured `ConnError`
   variants (`Net`, `RefusedTls`, `Protocol`, `Auth`, `Server` with SQLSTATE
   and fields) — matchable, not strings. The SCRAM nonce is drawn from OS
   randomness here, at the edge. TLS itself is composed by the consumer
@@ -74,7 +76,8 @@ the consumer through `nova-tls` (see `examples/live`).
   and the plaintext modes (Require → structured RefusedTls, Prefer/Disable →
   plaintext). Declares the `tls` dependency on nova-tls. The `multi` mode
   runs two queries on one connection with a for-in row iteration; `rowerr`
-  surfaces a 42601 through the iterator, then `skip_answer()` and the next
+  surfaces a 42601 through the iterator (for-in to the end, then
+  `conn.error()`), and the next
   query on the same connection.
 - `src/*_test.nv` — peer tests: every encoder against reference bytes from
   the protocol documentation, every decoder against reference frames, every
@@ -108,13 +111,13 @@ consume conn = match connect("127.0.0.1", 5432, "postgres", "pw", "postgres") {
 conn.query("SELECT generate_series(1, 5)")?
 mut sum = 0
 for row in conn {
-    sum += (text_at(row, 0) ?? "0").to_int() ?? 0
+    sum += (row.text_at(0) ?? "0").to_int() ?? 0
 }
-match conn.error() {                       // SQL errors land here,
-    Some(e) => { ro _ = conn.skip_answer() // then skip_answer() restores
-                 println("server error: ${e.to_str()}") } // the connection
+match conn.error() {              // a SQL error ends the loop; read it here
+    Some(e) => println("server error: ${e.to_str()}"),
     None => ()
-}
+}                                 // the next query drains any remainder
+                                 // implicitly - nothing to forget
 ro answer = conn.simple_query("SELECT 42")? // same connection, still usable
 ```
 

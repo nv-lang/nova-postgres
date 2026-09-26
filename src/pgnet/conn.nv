@@ -225,22 +225,43 @@ export type Connection consume {
 /// the ReadyForQuery that closes the cycle. A server ErrorResponse is one
 /// of the events (QueryError carries the SQLSTATE); the connection stays
 /// usable.
-export fn Connection mut @simple_query(q str) Net -> Result[[]PgEvent, ConnError] =>
+/// Like [`Connection @query`] the previous answer is drained first:
+/// an un-drained ReadyForQuery can never desync the protocol.
+export fn Connection mut @simple_query(q str) Net -> Result[[]PgEvent, ConnError] {
+    match @ensure_drained() {
+        Ok(()) => ()
+        Err(e) => return Err(e)
+    }
     simple_query_plain(@, q)
+}
 
 /// Run one extended-protocol cycle (Parse/Bind/Describe/Execute/Sync,
 /// unnamed statement and portal, text formats on both sides) with
 /// `params` — SQL NULL as ParamValue.null().
-export fn Connection mut @extended_query(sql str, params []ParamValue) Net -> Result[[]PgEvent, ConnError] =>
+/// The previous answer is drained first, as in [`Connection @simple_query`].
+export fn Connection mut @extended_query(sql str, params []ParamValue) Net -> Result[[]PgEvent, ConnError] {
+    match @ensure_drained() {
+        Ok(()) => ()
+        Err(e) => return Err(e)
+    }
     extended_query_plain(@, sql, params)
+}
 
 /// Queue a simple-protocol query and turn the connection into a row
 /// cursor: pull rows with `for row in conn` / [`Connection @next`].
 /// Nothing is collected up front — socket bytes are read only as the
 /// next row needs them. The connection is NOT given away; the next
-/// query runs on it as soon as this answer is drained (explicitly via
-/// [`Connection @skip_answer`], or by iterating to the end).
+/// query runs on it as soon as this answer is drained — by iterating
+/// to the end, or implicitly: an unfinished answer (including one cut
+/// short by a server error whose `error()` was never read) is drained
+/// and discarded here, so an un-drained ReadyForQuery can never
+/// desync the protocol. A fatal connection error surfaces as the
+/// returned Err instead.
 export fn Connection mut @query(q str) Net -> Result[(), ConnError] {
+    match @ensure_drained() {
+        Ok(()) => ()
+        Err(e) => return Err(e)
+    }
     match @session.query(q) {
         Ok(()) => ()
         Err(e) => return Err(ConnError.Protocol { error: e })
@@ -249,6 +270,26 @@ export fn Connection mut @query(q str) Net -> Result[(), ConnError] {
     @iter.pos = 0
     @iter.err_set = false
     @iter.done = false
+    Ok(())
+}
+
+// Read and discard the rest of the current answer, so the session is
+// Ready for the next one. The single implementation behind both the
+// implicit drain at query entry and the explicit [`Connection
+// @skip_answer`]. Cheap no-op when the answer already ended.
+fn Connection mut @ensure_drained() Net -> Result[(), ConnError] {
+    while !@iter.done {
+        ro _ = @next()
+    }
+    if @iter.err_set {
+        match @iter.err {
+            // A server error ends the answer but not the connection:
+            // the session reached ReadyForQuery and is reusable. The
+            // error stays readable via @error until the next query.
+            ConnError.Server { .. } => return Ok(())
+            _ => return Err(@iter.err)
+        }
+    }
     Ok(())
 }
 
@@ -400,31 +441,21 @@ export fn Connection @error() -> Option[ConnError] {
 /// so the session is Ready for the next query. For a server error this
 /// drains the skip to ReadyForQuery; a dead connection surfaces its
 /// error.
+/// Explicitly drain the rest of the current answer. Rarely needed —
+/// iterating to the end or starting the next query drains implicitly
+/// ([`Connection @ensure_drained`]); this is the early-exit form for
+/// code that wants the connection Ready NOW without starting a query.
+/// A remembered server error is cleared on success (it belongs to the
+/// finished answer); a fatal error is returned and the connection is
+/// dead. Same implementation as the implicit drain.
 export fn Connection mut @skip_answer() Net -> Result[(), ConnError] {
-    while true {
-        match @next() {
-            Some(_) => ()
-            None => {
-                match @iter.err_set {
-                    true => match @iter.err {
-                        ConnError.Server { .. } => {
-                            // The skip completed: the session reached
-                            // ReadyForQuery. The cycle is over — the
-                            // error was already read via @error — clear
-                            // it and be done; the connection is Ready
-                            // for the next query.
-                            @iter.err_set = false
-                            @iter.done = true
-                            return Ok(())
-                        }
-                        _ => return Err(@iter.err)
-                    }
-                    false => return Ok(())
-                }
-            }
+    match @ensure_drained() {
+        Ok(()) => {
+            @iter.err_set = false
+            Ok(())
         }
+        Err(e) => Err(e)
     }
-    Ok(())
 }
 
 /// Transaction-status byte of the last ReadyForQuery (`I`/`T`/`E`).
@@ -471,8 +502,12 @@ fn Connection consume @drain_for_cleanup() Net -> () {
 /// The row's `i`-th value as text — the ergonomic accessor for the
 /// common "read a column" case; NULL and non-UTF-8 values are
 /// structured errors, never silent defaults.
-export fn text_at(row PgEvent, i int) -> Result[str, ConnError] {
-    match row {
+/// Text-decode one column of a Row event — the chainable form:
+/// `row.text_at(0)?` in a for-in body. Non-Row events, a NULL value, a
+/// out-of-range index and invalid UTF-8 are structured errors, never
+/// panics.
+export fn PgEvent @text_at(i int) -> Result[str, ConnError] {
+    match @ {
         Row { values } => {
             if i < 0 || i >= values.len() {
                 ro pe = PostgresError { kind: Malformed { what: "column index out of range" } }
@@ -499,6 +534,12 @@ export fn text_at(row PgEvent, i int) -> Result[str, ConnError] {
         }
     }
 }
+
+/// The free-function spelling of [`PgEvent @text_at`], kept for
+/// call sites that hold the event indirectly.
+export fn text_at(row PgEvent, i int) -> Result[str, ConnError] =>
+    row.text_at(i)
+
 
 // ──────────────────────────────────────────────────────────────────────────
 // Per-transport implementations. The bodies are identical by design; they
