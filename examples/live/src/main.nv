@@ -233,13 +233,11 @@ fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mo
         Ok(e) => e
         Err(e) => return Err(e)
     }
-    mut si = 0
-    while si < evs0.len() {
-        match evs0[si] {
+    for e in evs0 {
+        match e {
             QueryError { sqlstate, message } => return Err("server error ${sqlstate}: ${message}")
             _ => ()
         }
-        si += 1
     }
     if session.phase() != SessionPhase.Ready {
         return Err("start-up did not reach ReadyForQuery")
