@@ -289,7 +289,8 @@ export fn RowStream mut @next() Net -> Result[Option[PgEvent], ConnError] {
 
 /// Give the connection back. Drains the rest of the answer first (rows
 /// not pulled by the caller are read and dropped), so the session is
-/// Ready for the next query.
+/// Ready for the next query. This is the reuse path — the same thing
+/// database/sql's Rows.Close does internally.
 export fn RowStream consume @finish() Net -> Result[Connection, ConnError] {
     mut done = false
     while !done {
