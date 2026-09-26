@@ -558,6 +558,13 @@ export fn PgEvent @i64_at(i int) -> Result[i64, ConnError] =>
         Err(_) => Err(malformed("not an i64: '${s}'"))
     })
 
+/// Column i decoded as i16 (Postgres smallint/int2).
+export fn PgEvent @i16_at(i int) -> Result[i16, ConnError] =>
+    @text_at(i).flat_map(|s| match s.to_i16() {
+        Ok(n) => Ok(n)
+        Err(_) => Err(malformed("not an i16: '${s}'"))
+    })
+
 /// Column i decoded as i32 (Postgres integer/serial).
 export fn PgEvent @i32_at(i int) -> Result[i32, ConnError] =>
     @text_at(i).flat_map(|s| match s.to_i32() {

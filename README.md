@@ -57,7 +57,10 @@ the consumer through `nova-tls` (see `examples/live`).
   ReadyForQuery, even past a server error). An unfinished answer can
   never desync the protocol: the next query drains it implicitly;
   `conn.skip_answer()` is the explicit early-exit form. `row.text_at(i)`
-  decodes one text column. Failures are structured `ConnError`
+  decodes a text column; `row.int_at` / `i16_at` / `i32_at` / `i64_at` /
+  `f64_at` / `bool_at` decode typed columns (`bool_at` understands the
+  wire format 't'/'f'; Postgres integers are signed, so no u* variants).
+  Failures are structured `ConnError`
   variants (`Net`, `RefusedTls`, `Protocol`, `Auth`, `Server` with SQLSTATE
   and fields) — matchable, not strings. The SCRAM nonce is drawn from OS
   randomness here, at the edge. TLS itself is composed by the consumer
@@ -111,7 +114,7 @@ consume conn = match connect("127.0.0.1", 5432, "postgres", "pw", "postgres") {
 conn.query("SELECT generate_series(1, 5)")?
 mut sum = 0
 for row in conn {
-    sum += (row.text_at(0) ?? "0").to_int() ?? 0
+    sum += row.int_at(0)?
 }
 match conn.error() {              // a SQL error ends the loop; read it here
     Some(e) => println("server error: ${e.to_str()}"),

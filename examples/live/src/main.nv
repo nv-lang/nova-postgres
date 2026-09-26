@@ -417,7 +417,7 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
     }
     println("live: query 1: ${count} rows iterated, sum ${sum}")
     // The same connection runs query 2 — nothing to give back.
-    conn.query("SELECT 42, 7::int8, 2.5::float8, true")?
+    conn.query("SELECT 42, 7::int8, 2.5::float8, true, 3::int2")?
     mut answer = 0
     mut big = 0 as i64
     mut frac = 0.0
@@ -427,6 +427,9 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
         big = row.i64_at(1)?
         frac = row.f64_at(2)?
         flag = row.bool_at(3)?
+        if row.i16_at(4)? != 3 as i16 {
+            return Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "i16_at(4) != 3" } } })
+        }
     }
     match conn.error() {
         Some(e) => return Err(e)
