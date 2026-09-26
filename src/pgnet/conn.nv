@@ -236,7 +236,10 @@ export type RowStream consume {
 export fn row_stream(consume conn Connection, q str) Net -> Result[RowStream, ConnError] {
     match conn.session.query(q) {
         Ok(()) => ()
-        Err(e) => return Err(ConnError.Protocol { error: e })
+        Err(e) => {
+            ro _c = conn.close()
+            return Err(ConnError.Protocol { error: e })
+        }
     }
     consume rows = RowStream { conn, pending: []PgEvent.new(), pos: 0 }
     Ok(rows)
@@ -291,17 +294,31 @@ export fn RowStream mut @next() Net -> Result[Option[PgEvent], ConnError] {
 /// pulled by the caller are read and dropped, so the server completes
 /// cleanly and the session is Ready) and give the connection back for
 /// the next query — the same thing database/sql's Rows.Close does
-/// internally. The abnormal ending is [`RowStream @abort`].
+/// internally. The abnormal ending is [`RowStream @abort`]. If draining
+/// fails, the connection is closed before the error returns — a dead
+/// stream never leaves the socket unterminated.
 export fn RowStream consume @close() Net -> Result[Connection, ConnError] {
     mut done = false
+    // Typed binding on purpose: a bare `None` literal infers as
+    // Option[int] at the C-codegen stage (the none_slice_lower family).
+    mut failed Option[ConnError] = None
     while !done {
         match @next() {
             Ok(Some(_)) => ()
             Ok(None) => { done = true }
-            Err(e) => return Err(e)
+            Err(e) => {
+                done = true
+                failed = Some(e)
+            }
         }
     }
-    Ok(@conn)
+    match failed {
+        Some(e) => {
+            ro _c = @conn.close()
+            Err(e)
+        }
+        None => Ok(@conn)
+    }
 }
 
 /// Abort the stream early: stop reading rows and close the connection
@@ -389,7 +406,10 @@ fn read_stream(mut s TcpStream, max int) Net -> Result[[]u8, ConnError] {
 fn start_plain(consume conn Connection) Net -> Result[Connection, ConnError] {
     ro evs = match pump_plain(conn) {
         Ok(e) => e
-        Err(e) => return Err(e)
+        Err(e) => {
+            ro _c = conn.close()
+            return Err(e)
+        }
     }
     startup_check_plain(conn, evs)
 }
