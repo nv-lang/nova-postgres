@@ -184,6 +184,7 @@ fn tls_handshake(consume stream TcpStream, server_name str, verify VerificationM
         Some(Tls13) => "TLS 1.3"
         None => "unknown TLS version"
     }
+    println("live: connected over ${tls_name} (authentication passed)")
     Ok(ts)
 }
 
