@@ -7,10 +7,11 @@ as pure state steps. The protocol core never opens a socket — the caller moves
 bytes, the same shape as `nova-tls`. A thin `pgnet` adapter over `std.net` is the
 only place a socket moves.
 
-**Status: work in progress.** Slices D8a (protocol as pure functions) and D8b
-(session state machine + network adapter) of the Nova plan 286 (database driver)
-are done. Type codecs and the `Db` effect facade come in later slices; TLS comes
-with `nova-tls`.
+**Status: work in progress.** Slices D8a (protocol as pure functions), D8b
+(session state machine + network adapter) and D8c (TLS negotiation step,
+structured adapter errors) of the Nova plan 286 (database driver) are done.
+Type codecs and the `Db` effect facade come in later slices. TLS is composed by
+the consumer through `nova-tls` (see `examples/live`).
 
 ## What is here
 
@@ -42,19 +43,30 @@ with `nova-tls`.
     steps with a caller-injected client nonce.
   - `md5_response` — the legacy MD5 password response.
   - `PostgresError` — one structural error domain for the whole package.
-- `src/pgnet/` — module `postgres.pgnet`: the thin `std.net` adapter.
-  `connect(host, port, user, password, database)` runs the start-up phase and
-  returns a Ready `Connection`; `simple_query` / `extended_query` run one
-  query round and return the events; `transaction_status` reads `I`/`T`/`E`;
-  `close` sends the final flush. The SCRAM nonce is drawn from OS randomness
-  here, at the edge.
+- `src/pgnet/` — module `postgres.pgnet`: the thin `std.net` adapter
+  (plaintext). `open_tcp` / `request_ssl` (sends SSLRequest, classifies the
+  answer byte with the pure `SslAnswer.classify`: `S` / `N` / any other byte
+  is a structured protocol error) / `connect_plain` (start-up +
+  authentication) build a Ready `Connection`; `simple_query` /
+  `extended_query` run one query round; `transaction_status` reads `I`/`T`/`E`;
+  `close` sends the final flush. Failures are structured `ConnError`
+  variants (`Net`, `RefusedTls`, `Protocol`, `Auth`, `Server` with SQLSTATE
+  and fields) — matchable, not strings. The SCRAM nonce is drawn from OS
+  randomness here, at the edge. TLS itself is composed by the consumer
+  through `nova-tls` (see `examples/live`; pgnet imports no tls types —
+  third-party package types do not survive this compiler's cross-module
+  boundary, see the module banner in `src/pgnet/conn.nv`).
 - `examples/smoke/` — the D8a live smoke (raw protocol over `std.net`).
 - `examples/session-check/` — the whole D8b dialog suite (every scripted
   exchange against reference bytes, each exchange also fed cut at every
   point, the illegal transitions, the transaction status) as a runnable
   program: prints `SESSION CHECKS OK`.
-- `examples/live/` — the D8b criterion-5 live run against a throwaway Docker
-  PostgreSQL on a Docker-chosen free port.
+- `examples/live/` — the D8c live run against two throwaway Docker
+  PostgreSQL containers on Docker-chosen free ports: TLS with your own CA
+  (SCRAM over TLS 1.3, `pg_stat_ssl`, the whole D8b flow, transaction
+  statuses T/E/I), structured TLS errors (hostname mismatch, unknown CA),
+  and the plaintext modes (Require → structured RefusedTls, Prefer/Disable →
+  plaintext). Declares the `tls` dependency on nova-tls.
 - `src/*_test.nv` — peer tests: every encoder against reference bytes from
   the protocol documentation, every decoder against reference frames, every
   proper prefix answering "need more bytes", streams cut at every byte, the
@@ -104,16 +116,26 @@ docker run --rm -d --name nova-pg-smoke -e POSTGRES_PASSWORD=smoke -p 55440:5432
 docker stop nova-pg-smoke
 ```
 
-Live session checks and the criterion-5 run (Docker picks a free port):
+Live session checks and the TLS live run (Docker picks free ports; the TLS
+container recipe with your own CA is in `BRIEF-D8c.md`):
 
 ```sh
 ./nova.sh build examples/session-check/src/main.nv -o target/session-check.exe
 ./target/session-check.exe
-docker run --rm -d --name nova-pg-d8b -e POSTGRES_PASSWORD=smoke -p 127.0.0.1::5432 postgres:15
-docker port nova-pg-d8b 5432                     # -> 127.0.0.1:<port>
+# TLS container with your own CA (recipe in BRIEF-D8c.md) + a plain one:
+docker run --rm -d --name nova-pg-d8c-tls  -e POSTGRES_PASSWORD=smoke -p 127.0.0.1::5432 postgres:15 bash -c '...'
+docker run --rm -d --name nova-pg-d8c-plain -e POSTGRES_PASSWORD=smoke -p 127.0.0.1::5432 postgres:15
+docker port nova-pg-d8c-tls 5432                 # -> 127.0.0.1:<tls-port>
+docker port nova-pg-d8c-plain 5432               # -> 127.0.0.1:<plain-port>
+docker cp nova-pg-d8c-tls:/var/lib/postgresql/ca.crt target/pg-ca.crt
 ./nova.sh build examples/live/src/main.nv -o target/live.exe
-./target/live.exe 127.0.0.1 <port>
-docker stop nova-pg-d8b
+./target/live.exe 127.0.0.1 <tls-port>  ca target/pg-ca.crt localhost
+./target/live.exe 127.0.0.1 <tls-port>  mismatch target/pg-ca.crt
+./target/live.exe 127.0.0.1 <tls-port>  system target/pg-ca.crt localhost
+./target/live.exe 127.0.0.1 <plain-port> require
+./target/live.exe 127.0.0.1 <plain-port> prefer target/pg-ca.crt
+./target/live.exe 127.0.0.1 <plain-port> disable
+docker stop nova-pg-d8c-tls nova-pg-d8c-plain
 ```
 
 License: MIT OR Apache-2.0.
