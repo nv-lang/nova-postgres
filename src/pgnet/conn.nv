@@ -572,7 +572,13 @@ export fn PgEvent @i32_at(i int) -> Result[i32, ConnError] =>
         Err(_) => Err(malformed("not an i32: '${s}'"))
     })
 
-/// Column i decoded as f64 (Postgres float/real/numeric text form).
+/// Column i decoded as f64 — Postgres float8 (double precision) and
+/// float4 (real, widened exactly). NOT numeric/decimal: those are
+/// arbitrary-precision (131072/16383 digits); decoding them as f64
+/// loses precision and range. Read numeric with text_at and parse it
+/// with a decimal package — pgnet stays std-only (third-party package
+/// types do not survive this compiler's cross-module boundary, see the
+/// module banner; nova-bignum additionally has no from-str parser yet).
 export fn PgEvent @f64_at(i int) -> Result[f64, ConnError] =>
     @text_at(i).flat_map(|s| match s.to_f64() {
         Ok(n) => Ok(n)
