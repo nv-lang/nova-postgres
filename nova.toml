@@ -7,19 +7,20 @@
 # Sans-I/O core (nova plan 286, slices D8a/D8b): the `postgres` module turns bytes
 # into protocol messages and messages into bytes, runs authentication as pure
 # state steps, and keeps the connection as a pure state machine — it never opens
-# a socket; the consumer pumps the bytes. The pure core depends on std ONLY. The
-# `postgres.pgnet` adapter (src/pgnet/) brings the `tls` package for TLS through
-# nova-tls (a C shim comes with it) — declared like nova-http does.
+# a socket; the consumer pumps the bytes. The whole package depends on std ONLY.
+# TLS (slice D8c) is composed by the CONSUMER through nova-tls — see
+# examples/live, which declares the `tls` dependency like nova-http does. The
+# adapter pgnet deliberately imports no tls types: third-party (git) package
+# types do not survive this compiler's cross-module boundary (see the module
+# banner in src/pgnet/conn.nv and the D8c hand-over).
 
 [package]
 name = "postgres"
 version = "0.1.0"
-description = "PostgreSQL wire protocol (framing, SCRAM-SHA-256, MD5) as pure Nova functions — sans-I/O core; TLS-capable network adapter"
+description = "PostgreSQL wire protocol (framing, SCRAM-SHA-256, MD5) as pure Nova functions — sans-I/O core and a plaintext network adapter; TLS is composed by the consumer"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nv-lang/nova-postgres"
 
 [lib]
 src = "src"
 
-[dependencies]
-tls = { git = "https://github.com/nv-lang/nova-tls", version = "0.1" }

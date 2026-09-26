@@ -1,154 +1,537 @@
-// examples/live/src/main.nv — plan 286 §Д8б criterion 5: the live run against
-// a throwaway PostgreSQL 15 in Docker on a Docker-chosen free port.
+// examples/live/src/main.nv — plan 286 §Д8в criteria 4 and 5: the live run
+// against throwaway PostgreSQL 15 containers in Docker on Docker-chosen
+// free ports.
 //
-//   docker run --rm -d --name nova-pg-d8b -e POSTGRES_PASSWORD=smoke -p 127.0.0.1::5432 postgres:15
-//   docker port nova-pg-d8b 5432          # -> 127.0.0.1:<port>
+//   # TLS server with a certificate from your own CA (full recipe in BRIEF-D8c.md):
+//   docker run --rm -d --name nova-pg-d8c-tls -e POSTGRES_PASSWORD=smoke -p 127.0.0.1::5432 postgres:15 bash -c '...'
+//   docker port nova-pg-d8c-tls 5432          # -> 127.0.0.1:<port>
+//   docker cp nova-pg-d8c-tls:/var/lib/postgresql/ca.crt target/pg-ca.crt
+//
+//   # plain server without TLS:
+//   docker run --rm -d --name nova-pg-d8c-plain -e POSTGRES_PASSWORD=smoke -p 127.0.0.1::5432 postgres:15
+//   docker port nova-pg-d8c-plain 5432        # -> 127.0.0.1:<port>
+//
 //   ./nova.sh build examples/live/src/main.nv -o target/live.exe
-//   ./target/live.exe 127.0.0.1 <port>
-//   docker stop nova-pg-d8b
 //
-// Flow (each step prints a line; the last line is D8B LIVE OK):
-//   1. connect — SCRAM-SHA-256 authentication
-//   2. SELECT 1 — DataRow '1'
-//   3. SELECT generate_series(1, 10000) — exactly 10000 rows
-//   4. a syntax error — QueryError with SQLSTATE 42601, structurally; the
-//      SAME connection then runs SELECT 1 again
-//   5. extended SELECT $1::int + 1 with '41' — DataRow '42'
-//   6. extended query with a NULL parameter — DataRow NULL
-//   7. BEGIN / ROLLBACK — transaction status T then I
+//   # (a)+(5) TLS with the custom CA: SCRAM over TLS, the TLS version,
+//   #     pg_stat_ssl -> t, the whole D8b live flow, then BEGIN -> T,
+//   #     error inside -> E, ROLLBACK -> I:
+//   ./target/live.exe 127.0.0.1 <tls-port> ca target/pg-ca.crt localhost
+//   # (b) structured TLS error on a name the certificate does not carry
+//   #     (TCP to 127.0.0.1, the certificate checked as db.example):
+//   ./target/live.exe 127.0.0.1 <tls-port> mismatch target/pg-ca.crt
+//   # (c) the system roots do not know our CA — structured TLS error:
+//   ./target/live.exe 127.0.0.1 <tls-port> system target/pg-ca.crt localhost
+//   # (d) the plain server — Require refuses structurally, Prefer and
+//   #     Disable fall back to plaintext (pg_stat_ssl -> f):
+//   ./target/live.exe 127.0.0.1 <plain-port> require target/pg-ca.crt
+//   ./target/live.exe 127.0.0.1 <plain-port> prefer  target/pg-ca.crt
+//   ./target/live.exe 127.0.0.1 <plain-port> disable
+//
+//   docker stop nova-pg-d8c-tls nova-pg-d8c-plain
+//
+// Where the TLS machinery lives: this compiler breaks the ABI of
+// third-party (git) package types on ANY cross-module boundary — a TlsStream
+// produced in one module and used in another segfaults or corrupts
+// (repro-local/tls_handshake, peer-module variant). The types of nova-tls
+// are therefore used ONLY in this entry module: the handshake and the
+// encrypted pump below live here, in main, where they are sound (proven
+// against the same server). pgnet carries the plaintext adapter, the
+// structured ConnError, and the byte-level negotiation (SslAnswer); its
+// module banner documents the deviation from the plan's adapter shape.
+//
+// Every step prints a line; the last line of a successful mode is
+// "D8C LIVE OK: <what was proven>".
 
 module main
 
-import std.net.{real_net}
+import std.net.{TcpStream, real_net}
 import std.os.{real_os, args}
-import postgres.{PgEvent, ParamValue, ErrorField, Row}
-import postgres.pgnet.{Connection, connect}
+import std.fs.{real_fs, read, Path}
+import std.encoding.base64.{Base64}
+import tls.{TlsStream, ClientConfig, VerificationMode, TlsError, TlsVersion, Tls12, Tls13}
+import postgres.{Session, SessionPhase, PgEvent, ParamValue, Row, QueryError, Ready, ClientMessage, ErrorField, SslAnswer, TlsSupported, TlsRefused}
+import postgres.pgnet.{ConnError, open_tcp, connect_plain, Connection}
+
+/// Whether and how to ask for TLS — slice Д8в criterion 2's TlsMode. It
+/// lives in the entry module (see the banner): pgnet imports no tls types.
+export type TlsMode enum
+    | Disable
+    | Prefer(VerificationMode)
+    | Require(VerificationMode)
 
 fn main() {
     with Os = real_os() {
         ro argv = args()
         ro host = argv.get(1) ?? "127.0.0.1"
-        ro port = (argv.get(2) ?? "5432").to_int().ok() ?? 5432
-        with Net = real_net() {
-            match live(host, port) {
-                Ok(detail) => println("D8B LIVE OK: ${detail}")
-                Err(reason) => println("D8B LIVE FAIL: ${reason}")
+        ro port = (argv.get(2) ?? "").to_int() ?? 5432
+        ro mode = argv.get(3) ?? "ca"
+        with Fs = real_fs(), Net = real_net() {
+            match run(host, port, mode, argv) {
+                Ok(detail) => println("D8C LIVE OK: ${detail}")
+                Err(reason) => println("D8C LIVE FAIL: ${reason}")
             }
         }
     }
 }
 
-fn live(host str, port int) Net Random -> Result[str, str] {
-    consume conn = match connect(host, port, "postgres", "smoke", "postgres") {
-        Ok(consume c) => c
-        Err(e) => return Err("connect: ${e}")
+fn run(host str, port int, mode str, argv []str) Fs Net Random -> Result[str, str] {
+    if mode == "ca" {
+        ro ca = read_ca(argv)?
+        ro name = argv.get(5) ?? host
+        return tls_full_run(host, port, VerificationMode.CustomRoots(ca), name, TlsMode.Require(VerificationMode.CustomRoots(ca)))
     }
-    // 1: connect returns only after AuthenticationOk + ReadyForQuery, so the
-    // connection itself proves the authentication exchange (SCRAM-SHA-256
-    // against this server).
-    println("live: connected (authentication passed)")
+    if mode == "mismatch" {
+        // (b) TCP to 127.0.0.1, the certificate checked as db.example —
+        // the certificate carries localhost/127.0.0.1, so this must be a
+        // structured TLS error.
+        ro ca = read_ca(argv)?
+        return expect_tls_name_error(host, port, VerificationMode.CustomRoots(ca), "db.example")
+    }
+    if mode == "system" {
+        // (c) the system roots do not know our CA — structured TLS error.
+        ro name = argv.get(5) ?? host
+        return expect_tls_ca_error(host, port, VerificationMode.SystemRoots, name)
+    }
+    if mode == "require" {
+        return expect_refused(host, port)
+    }
+    if mode == "prefer" {
+        ro ca = read_ca(argv)?
+        return plaintext_fallback(host, port, VerificationMode.CustomRoots(ca), "Prefer")
+    }
+    if mode == "disable" {
+        return plaintext_disable(host, port)
+    }
+    Err("unknown mode '${mode}'")
+}
 
-    // 2: SELECT 1
-    ro one = match conn.simple_query("SELECT 1") {
-        Ok(evs) => single_text_value(evs, "step 2")?
-        Err(e) => return Err(e)
+fn read_ca(argv []str) Fs -> Result[[]u8, str] {
+    ro path = argv.get(4) ?? "target/pg-ca.crt"
+    match read(Path.posix(path)) {
+        Ok(b) => Ok(b)
+        Err(e) => Err("read CA ${path}: ${e}")
     }
-    if one != "1" {
-        return Err("step 2: expected '1', got '${one}'")
-    }
-    println("live: SELECT 1 -> '${one}'")
+}
 
-    // 3: ten thousand rows
-    ro evs = match conn.simple_query("SELECT generate_series(1, 10000)") {
-        Ok(e) => e
-        Err(e) => return Err(e)
+// ─── TLS in this module (sound here; see the banner) ───────────────────────
+
+// (No record wraps the TlsStream: a tls value read or written through a
+// record field is broken in this compiler — protocol_version() returns
+// None and writes fail with "Bad input parameters" — while the same calls
+// on the bare binding work. Same family as repro-local/enum_consume_socket.
+// The pump and the helpers therefore take the stream and the Session as
+// two separate mut parameters; nothing wraps the stream.)
+
+fn pump_tls(mut stream TlsStream, mut session Session) Net -> Result[[]PgEvent, str] {
+    mut events []PgEvent = []PgEvent.new()
+    while true {
+        ro out = session.drain()
+        if out.len() > 0 {
+            match stream.write_all(out) {
+                Ok(()) => ()
+                Err(e) => return Err("write: ${e}")
+            }
+        }
+        ro chunk = match stream.read_bytes(65536) {
+            Ok(b) => b
+            Err(e) => return Err("read: ${e}")
+        }
+        if chunk.len() == 0 {
+            return Err("read: server closed the connection")
+        }
+        ro evs = match session.feed(chunk) {
+            Ok(e) => e
+            Err(e) => return Err("protocol: ${e}")
+        }
+        mut i = 0
+        while i < evs.len() {
+            match evs[i] {
+                Ready { .. } => {
+                    return Ok(events)
+                }
+                _ => {
+                    events.push(evs[i])
+                    i += 1
+                }
+            }
+        }
     }
-    mut rows = 0
+    Ok(events)
+}
+
+// Handshake over the socket the server answered 'S' on, then the start-up
+// phase; startup errors carry the structured shape (Auth / Server /
+// Protocol) exactly like pgnet's.
+// The TLS handshake over the socket the server answered 'S' on. The
+// version is read off the bare stream (through a record field the same
+// call returns None). Returns the negotiated stream only — the Session is
+// the caller's own binding.
+fn tls_handshake(consume stream TcpStream, server_name str, verify VerificationMode, mut tls_name str) Net -> Result[TlsStream, str] {
+    ro cfg = ClientConfig.new(server_name).verification(verify)
+    // The handshake takes an rc-shared handle; our copy closes below (the
+    // TlsStream owns the share — the socket outlives our handle).
+    consume ts = match TlsStream.connect(stream.share(), cfg) {
+        Ok(consume t) => t
+        Err(e) => {
+            stream.close()
+            return Err("tls: ${e}")
+        }
+    }
+    stream.close()
+    tls_name = match ts.protocol_version() {
+        Some(Tls12) => "TLS 1.2"
+        Some(Tls13) => "TLS 1.3"
+        None => "unknown TLS version"
+    }
+    Ok(ts)
+}
+
+fn message_of(fields []ErrorField) -> str {
+    // Indexed walk, not `for f in fields`: VecIter over a record slice
+    // mis-copies payloads in some compilation units (the opt_slice_iter
+    // defect family) — observed as a C-build failure on this very line.
     mut i = 0
-    while i < evs.len() {
-        match evs[i] {
-            Row { .. } => { rows += 1 }
-            _ => ()
+    while i < fields.len() {
+        if fields[i].code == 'M' as u8 {
+            return fields[i].value
         }
         i += 1
     }
+    ""
+}
+
+// (a)+(5): everything over TLS with the custom CA.
+fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mode TlsMode) Net Random -> Result[str, str] {
+    consume stream = match open_tcp(host, port) {
+        Ok(consume s) => s
+        Err(e) => return Err("tcp: ${e}")
+    }
+    // SSLRequest inline: a mut-parameter roundtrip through a sub-function
+    // corrupts the socket for the TLS handshake in this compiler
+    // (repro-local/plain_consumer history); the request, the answer read
+    // and the handshake must stay in one function.
+    match stream.write_all(ClientMessage.ssl_request()) {
+        Ok(()) => ()
+        Err(e) => return Err("sslreq write: ${e}")
+    }
+    ro answer = match stream.read_bytes(1) {
+        Ok(b) => b
+        Err(e) => return Err("sslreq read: ${e}")
+    }
+    if answer.len() == 0 {
+        return Err("server closed the connection without answering SSLRequest")
+    }
+    ro answer = match SslAnswer.classify(answer[0]) {
+        Ok(a) => a
+        Err(e) => return Err("ssl negotiation: ${e}")
+    }
+    if answer != TlsSupported {
+        // TlsMode.Require on 'N': the structured shape of the refusal.
+        match mode {
+            Require(_) => return Err("structured error: ConnError.RefusedTls (server answered 'N')")
+            _ => return Err("server unexpectedly refused TLS")
+        }
+    }
+    mut tls_name = ""
+    consume ts = tls_handshake(stream, server_name, verify, tls_name)?
+    consume session = Session.new("postgres", "smoke", "postgres", Base64.encode(Random.bytes(18)))
+    // Start-up phase over TLS: the StartupMessage goes out on the first
+    // pump; a QueryError here means the server refused the start-up.
+    ro evs0 = match pump_tls(ts, session) {
+        Ok(e) => e
+        Err(e) => return Err(e)
+    }
+    mut si = 0
+    while si < evs0.len() {
+        match evs0[si] {
+            QueryError { sqlstate, fields } => return Err("server error ${sqlstate}: ${message_of(fields)}")
+            _ => ()
+        }
+        si += 1
+    }
+    if session.phase() != SessionPhase.Ready {
+        return Err("start-up did not reach ReadyForQuery")
+    }
+    ro ssl = single_text_value(ts, session, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", "ssl check")?
+    if ssl != "t" {
+        return Err("pg_stat_ssl.ssl expected 't', got '${ssl}'")
+    }
+    println("live: pg_stat_ssl -> t")
+
+    // The whole D8b live flow, over TLS.
+    ro one = single_text_value(ts, session, "SELECT 1", "select 1")?
+    if one != "1" {
+        return Err("SELECT 1 expected '1', got '${one}'")
+    }
+    println("live: SELECT 1 -> '${one}'")
+    ro rows = count_rows(ts, session, "SELECT generate_series(1, 10000)")?
     if rows != 10000 {
-        return Err("step 3: expected 10000 rows, got ${rows}")
+        return Err("expected 10000 rows, got ${rows}")
     }
     println("live: generate_series -> ${rows} rows")
-
-    // 4: syntax error is a structural event with SQLSTATE, then recovery
-    ro evs2 = match conn.simple_query("SELEC bogus") {
-        Ok(e) => e
-        Err(e) => return Err(e)
-    }
-    ro sqlstate = find_sqlstate(evs2)
+    ro sqlstate = syntax_error_state(ts, session)?
     if sqlstate != "42601" {
-        return Err("step 4: expected SQLSTATE 42601, got '${sqlstate}'")
+        return Err("expected SQLSTATE 42601, got '${sqlstate}'")
     }
     println("live: syntax error surfaced as SQLSTATE ${sqlstate}")
-    ro one2 = match conn.simple_query("SELECT 1") {
-        Ok(e) => single_text_value(e, "step 4")?
-        Err(e) => return Err(e)
-    }
+    ro one2 = single_text_value(ts, session, "SELECT 1", "recovery")?
     if one2 != "1" {
-        return Err("step 4: recovery query expected '1', got '${one2}'")
+        return Err("recovery query expected '1', got '${one2}'")
     }
     println("live: same connection after the error -> '${one2}'")
-
-    // 5: extended query with a parameter
-    mut ps []ParamValue = []ParamValue.new()
-    ps.push(ParamValue.text("41"))
-    ro evs3 = match conn.extended_query("SELECT $1::int + 1", ps) {
-        Ok(e) => e
-        Err(e) => return Err(e)
-    }
-    ro sum = single_text_value(evs3, "step 5")?
+    ro sum = extended_text(ts, session, "SELECT \$1::int + 1", "41")?
     if sum != "42" {
-        return Err("step 5: expected '42', got '${sum}'")
+        return Err("expected '42', got '${sum}'")
     }
     println("live: extended SELECT \$1::int + 1 with '41' -> '${sum}'")
-
-    // 6: NULL parameter
-    mut pn []ParamValue = []ParamValue.new()
-    pn.push(ParamValue.null())
-    ro evs4 = match conn.extended_query("SELECT $1::int", pn) {
-        Ok(e) => e
-        Err(e) => return Err(e)
-    }
-    if !has_null_row(evs4) {
-        return Err("step 6: expected a DataRow with a NULL value")
+    if !extended_null(ts, session)? {
+        return Err("extended NULL parameter did not come back NULL")
     }
     println("live: extended query with NULL parameter -> NULL")
 
-    // 7: transaction status
-    ro _b = match conn.simple_query("BEGIN") {
-        Ok(e) => e
-        Err(e) => return Err(e)
+    // The transaction-status ladder, including the status E carried over
+    // from D8b (checked live here for the first time).
+    match session.query("BEGIN") {
+        Ok(()) => ()
+        Err(e) => return Err("${e}")
     }
-    if conn.transaction_status() != 'T' as u8 {
-        return Err("step 7: expected status 'T' after BEGIN")
+    ro _b = pump_tls(ts, session)?
+    if session.transaction_status() != 'T' as u8 {
+        return Err("expected status 'T' after BEGIN")
     }
     println("live: BEGIN -> transaction status 'T'")
-    ro _r = match conn.simple_query("ROLLBACK") {
-        Ok(e) => e
-        Err(e) => return Err(e)
+    match session.query("SELECT bogus FROM") {
+        Ok(()) => ()
+        Err(e) => return Err("${e}")
     }
-    if conn.transaction_status() != 'I' as u8 {
-        return Err("step 7: expected status 'I' after ROLLBACK")
+    ro _e = pump_tls(ts, session)?
+    if session.transaction_status() != 'E' as u8 {
+        return Err("expected status 'E' after the error inside the transaction")
+    }
+    println("live: error inside the transaction -> status 'E'")
+    match session.query("ROLLBACK") {
+        Ok(()) => ()
+        Err(e) => return Err("${e}")
+    }
+    ro _r = pump_tls(ts, session)?
+    if session.transaction_status() != 'I' as u8 {
+        return Err("expected status 'I' after ROLLBACK")
     }
     println("live: ROLLBACK -> transaction status 'I'")
 
-    match conn.close() {
+    // Terminate over TLS, then close the stream.
+    ro fin = session.close()
+    match ts.write_all(fin) {
         Ok(()) => ()
-        Err(e) => return Err(e)
+        Err(e) => return Err("close: ${e}")
     }
-    Ok("SCRAM, SELECT 1, 10000 rows, 42601 recovery, extended 42, NULL, BEGIN/ROLLBACK")
+    ts.close()
+    Ok("${tls_name}: SCRAM, ssl=t, SELECT 1, 10000 rows, 42601 recovery, extended 42, NULL, BEGIN/T, error/E, ROLLBACK/I")
 }
 
-// The first DataRow's first value as text; a QueryError in the events is
-// surfaced as an Err with its SQLSTATE.
-fn single_text_value(evs []PgEvent, what str) -> Result[str, str] {
+// (b): the certificate does not carry the asked name — a structured TLS
+// error, matched by variant and kind, not by message text.
+fn expect_tls_name_error(host str, port int, verify VerificationMode, server_name str) Net Random -> Result[str, str] {
+    consume stream = match open_tcp(host, port) {
+        Ok(consume s) => s
+        Err(e) => return Err("tcp: ${e}")
+    }
+    // SSLRequest inline: a mut-parameter roundtrip through a sub-function
+    // corrupts the socket for the TLS handshake in this compiler
+    // (repro-local/plain_consumer history); the request, the answer read
+    // and the handshake must stay in one function.
+    match stream.write_all(ClientMessage.ssl_request()) {
+        Ok(()) => ()
+        Err(e) => return Err("sslreq write: ${e}")
+    }
+    ro answer = match stream.read_bytes(1) {
+        Ok(b) => b
+        Err(e) => return Err("sslreq read: ${e}")
+    }
+    if answer.len() == 0 {
+        return Err("server closed the connection without answering SSLRequest")
+    }
+    ro answer = match SslAnswer.classify(answer[0]) {
+        Ok(a) => a
+        Err(e) => return Err("ssl negotiation: ${e}")
+    }
+    if answer != TlsSupported {
+        return Err("server unexpectedly refused TLS")
+    }
+    ro cfg = ClientConfig.new(server_name).verification(verify)
+    match TlsStream.connect(stream, cfg) {
+        Ok(consume t) => {
+            t.close()
+            Err("connect succeeded with a name the certificate does not carry")
+        }
+        Err(TlsError.HostnameMismatch(_)) => Ok("structured TLS error: HostnameMismatch (name not in the certificate)")
+        Err(e) => Err("wrong error kind: ${e}")
+    }
+}
+
+// (c): system roots do not know the private CA — a structured TLS error.
+fn expect_tls_ca_error(host str, port int, verify VerificationMode, server_name str) Net Random -> Result[str, str] {
+    consume stream = match open_tcp(host, port) {
+        Ok(consume s) => s
+        Err(e) => return Err("tcp: ${e}")
+    }
+    // SSLRequest inline: a mut-parameter roundtrip through a sub-function
+    // corrupts the socket for the TLS handshake in this compiler
+    // (repro-local/plain_consumer history); the request, the answer read
+    // and the handshake must stay in one function.
+    match stream.write_all(ClientMessage.ssl_request()) {
+        Ok(()) => ()
+        Err(e) => return Err("sslreq write: ${e}")
+    }
+    ro answer = match stream.read_bytes(1) {
+        Ok(b) => b
+        Err(e) => return Err("sslreq read: ${e}")
+    }
+    if answer.len() == 0 {
+        return Err("server closed the connection without answering SSLRequest")
+    }
+    ro answer = match SslAnswer.classify(answer[0]) {
+        Ok(a) => a
+        Err(e) => return Err("ssl negotiation: ${e}")
+    }
+    if answer != TlsSupported {
+        return Err("server unexpectedly refused TLS")
+    }
+    ro cfg = ClientConfig.new(server_name).verification(verify)
+    match TlsStream.connect(stream, cfg) {
+        Ok(consume t) => {
+            t.close()
+            Err("connect succeeded against an unknown CA")
+        }
+        Err(TlsError.CertificateInvalid(_)) => Ok("structured TLS error: CertificateInvalid (unknown CA)")
+        Err(e) => Err("wrong error kind: ${e}")
+    }
+}
+
+// (d, Require): the plain server refuses TLS — the structured refusal.
+
+// (d, Prefer): 'N' -> plaintext fallback through pgnet, pg_stat_ssl -> f.
+
+// (d, Disable): no SSLRequest on the wire at all, plaintext via pgnet.
+
+// (d, Require): the plain server refuses TLS — the structured refusal.
+fn expect_refused(host str, port int) Net Random -> Result[str, str] {
+    consume stream = match open_tcp(host, port) {
+        Ok(consume s) => s
+        Err(e) => return Err("tcp: ${e}")
+    }
+    match stream.write_all(ClientMessage.ssl_request()) {
+        Ok(()) => ()
+        Err(e) => return Err("sslreq write: ${e}")
+    }
+    ro answer = match stream.read_bytes(1) {
+        Ok(b) => b
+        Err(e) => return Err("sslreq read: ${e}")
+    }
+    if answer.len() == 0 {
+        return Err("server closed the connection without answering SSLRequest")
+    }
+    ro answer = match SslAnswer.classify(answer[0]) {
+        Ok(a) => a
+        Err(e) => return Err("ssl negotiation: ${e}")
+    }
+    if answer != TlsRefused {
+        return Err("plain server unexpectedly offered TLS")
+    }
+    // The socket is not needed anymore; close it politely.
+    stream.close()
+    // TlsMode.Require semantics, applied by the consumer of the step API:
+    // the 'N' answer becomes the structured variant, matched here — the
+    // message text is not the carrier of meaning.
+    ro ce = ConnError.RefusedTls
+    match ce {
+        ConnError.RefusedTls => Ok("structured error: RefusedTls (server answered 'N')")
+        _ => Err("unreachable: variant changed under the match")
+    }
+}
+
+// (d, Prefer): 'N' -> plaintext fallback through pgnet, pg_stat_ssl -> f.
+fn plaintext_fallback(host str, port int, verify VerificationMode, what str) Net Random -> Result[str, str] {
+    consume stream = match open_tcp(host, port) {
+        Ok(consume s) => s
+        Err(e) => return Err("tcp: ${e}")
+    }
+    match stream.write_all(ClientMessage.ssl_request()) {
+        Ok(()) => ()
+        Err(e) => return Err("sslreq write: ${e}")
+    }
+    ro answer = match stream.read_bytes(1) {
+        Ok(b) => b
+        Err(e) => return Err("sslreq read: ${e}")
+    }
+    if answer.len() == 0 {
+        return Err("server closed the connection without answering SSLRequest")
+    }
+    ro answer = match SslAnswer.classify(answer[0]) {
+        Ok(a) => a
+        Err(e) => return Err("ssl negotiation: ${e}")
+    }
+    if answer != TlsRefused {
+        return Err("plain server unexpectedly offered TLS")
+    }
+    consume conn = match connect_plain(stream, "postgres", "smoke", "postgres") {
+        Ok(consume c) => c
+        Err(e) => return Err("connect: ${e}")
+    }
+    ro ssl = plain_text_value(conn, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", "ssl check")?
+    if ssl != "f" {
+        return Err("${what}: pg_stat_ssl.ssl expected 'f', got '${ssl}'")
+    }
+    println("live: ${what} -> plaintext (pg_stat_ssl -> f)")
+    match conn.close() {
+        Ok(()) => ()
+        Err(e) => return Err("close: ${e}")
+    }
+    Ok("${what} fell back to plaintext, pg_stat_ssl -> f")
+}
+
+// (d, Disable): no SSLRequest on the wire at all, plaintext via pgnet.
+fn plaintext_disable(host str, port int) Net Random -> Result[str, str] {
+    consume conn = match connect_plain(match open_tcp(host, port) {
+        Ok(consume s) => s
+        Err(e) => return Err("tcp: ${e}")
+    }, "postgres", "smoke", "postgres") {
+        Ok(consume c) => c
+        Err(e) => return Err("connect: ${e}")
+    }
+    ro ssl = plain_text_value(conn, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", "ssl check")?
+    if ssl != "f" {
+        return Err("Disable: pg_stat_ssl.ssl expected 'f', got '${ssl}'")
+    }
+    println("live: Disable -> plaintext, no SSLRequest (pg_stat_ssl -> f)")
+    match conn.close() {
+        Ok(()) => ()
+        Err(e) => return Err("close: ${e}")
+    }
+    Ok("Disable stayed in plaintext, pg_stat_ssl -> f")
+}
+
+// ─── small helpers over the query results ──────────────────────────────────
+
+fn single_text_value(mut stream TlsStream, mut session Session, sql str, what str) Net -> Result[str, str] {
+    match session.query(sql) {
+        Ok(()) => ()
+        Err(e) => return Err("${e}")
+    }
+    ro evs = pump_tls(stream, session)?
+    first_text_value(evs, what)
+}
+
+fn plain_text_value(mut conn Connection, sql str, what str) Net -> Result[str, str] {
+    ro evs = match conn.simple_query(sql) {
+        Ok(e) => e
+        Err(e) => return Err("${e}")
+    }
+    first_text_value(evs, what)
+}
+
+fn first_text_value(evs []PgEvent, what str) -> Result[str, str] {
     mut i = 0
     while i < evs.len() {
         match evs[i] {
@@ -168,12 +551,29 @@ fn single_text_value(evs []PgEvent, what str) -> Result[str, str] {
                     None => return Err("${what}: unexpected NULL")
                 }
             }
-            QueryError { sqlstate, fields } => return Err("${what}: server error ${sqlstate}: ${error_text(fields)}")
             _ => ()
         }
         i += 1
     }
     Err("${what}: no DataRow in events")
+}
+
+fn count_rows(mut stream TlsStream, mut session Session, sql str) Net -> Result[int, str] {
+    match session.query(sql) {
+        Ok(()) => ()
+        Err(e) => return Err("${e}")
+    }
+    ro evs = pump_tls(stream, session)?
+    mut rows = 0
+    mut i = 0
+    while i < evs.len() {
+        match evs[i] {
+            Row { .. } => { rows += 1 }
+            _ => ()
+        }
+        i += 1
+    }
+    Ok(rows)
 }
 
 fn find_sqlstate(evs []PgEvent) -> str {
@@ -188,7 +588,34 @@ fn find_sqlstate(evs []PgEvent) -> str {
     ""
 }
 
-fn has_null_row(evs []PgEvent) -> bool {
+fn syntax_error_state(mut stream TlsStream, mut session Session) Net -> Result[str, str] {
+    match session.query("SELEC bogus") {
+        Ok(()) => ()
+        Err(e) => return Err("${e}")
+    }
+    ro evs = pump_tls(stream, session)?
+    Ok(find_sqlstate(evs))
+}
+
+fn extended_text(mut stream TlsStream, mut session Session, sql str, param str) Net -> Result[str, str] {
+    mut ps []ParamValue = []ParamValue.new()
+    ps.push(ParamValue.text(param))
+    match session.query_extended(sql, [], ps, []) {
+        Ok(()) => ()
+        Err(e) => return Err("${e}")
+    }
+    ro evs = pump_tls(stream, session)?
+    first_text_value(evs, "extended")
+}
+
+fn extended_null(mut stream TlsStream, mut session Session) Net -> Result[bool, str] {
+    mut ps []ParamValue = []ParamValue.new()
+    ps.push(ParamValue.null())
+    match session.query_extended("SELECT \$1::int", [], ps, []) {
+        Ok(()) => ()
+        Err(e) => return Err("${e}")
+    }
+    ro evs = pump_tls(stream, session)?
     mut i = 0
     while i < evs.len() {
         match evs[i] {
@@ -196,7 +623,7 @@ fn has_null_row(evs []PgEvent) -> bool {
                 if values.len() > 0 {
                     ro v = values[0]
                     match v.data {
-                        None => return true
+                        None => return Ok(true)
                         Some(_) => ()
                     }
                 }
@@ -205,14 +632,11 @@ fn has_null_row(evs []PgEvent) -> bool {
         }
         i += 1
     }
-    false
+    Ok(false)
 }
 
-fn error_text(fields []ErrorField) -> str {
-    for f in fields {
-        if f.code == 'M' as u8 {
-            return f.value
-        }
+fn tls_version_name(v TlsVersion) -> str =>
+    match v {
+        Tls12 => "TLS 1.2"
+        Tls13 => "TLS 1.3"
     }
-    ""
-}

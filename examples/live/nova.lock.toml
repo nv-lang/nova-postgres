@@ -8,3 +8,11 @@ version = 1
 name = "postgres"
 source = "path"
 path = "../.."
+
+[[package]]
+name = "tls"
+source = "git"
+git = "https://github.com/nv-lang/nova-tls"
+pin = "version:>=0.1.0, <0.2.0"
+version = "0.1.8"
+commit = "7fad86615a8cfa84c3e874fde5cc7e0532252d36"

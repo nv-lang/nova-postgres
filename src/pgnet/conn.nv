@@ -1,14 +1,32 @@
 // src/pgnet/conn.nv — the thin network adapter (slice Д8б, TLS in Д8в): the
 // ONLY place a socket moves. Everything protocol-shaped lives in the pure
 // `postgres` package (Session, ClientMessage, ServerMessage, SslAnswer);
-// this module pumps bytes between a socket and a Session: connect (TCP,
-// optional TLS negotiation through nova-tls, start-up + authentication),
-// simple and extended queries, close.
+// this module moves bytes between a socket and a Session.
 //
-// The stream of a connection is either the plain TcpStream or a TlsStream
-// (handshake over the already open socket after the server answers 'S' to
-// SSLRequest — exactly the shape PostgreSQL documents). The Session does
-// not change and does not know about TLS.
+// There is deliberately NO either-type of streams in this API: a consume
+// enum's type resolves empty in this compiler (repro-local/
+// enum_consume_socket), fn-pointer types cannot declare consume
+// parameters, and copying a TlsStream is unsafe. The transport is instead
+// chosen by the CALLER's control flow, in three small steps:
+//
+//   1. open_tcp(options)                        — the TCP connection;
+//   2. request_ssl(stream)                      — SSLRequest, the server's
+//      single answer byte classified by the pure SslAnswer.classify ('S' /
+//      'N' / structured protocol error); the socket comes back in a
+//      consume record beside the answer;
+//   3. connect_tls(stream, options, name, mode) or connect_plain(stream,
+//      options) — handshake-over-the-same-socket (nova-tls) or plaintext,
+//      then the start-up phase (StartupMessage, authentication — trust,
+//      cleartext, MD5, SCRAM-SHA-256 — ParameterStatus/BackendKeyData, up
+//      to the first ReadyForQuery).
+//
+// TlsMode (Disable/Prefer/Require) describes the caller's policy; with the
+// step API the caller applies it in its own branches (Require + 'N' ->
+// ConnError.RefusedTls, Prefer + 'N' -> connect_plain, Disable -> skip
+// request_ssl entirely — no SSLRequest bytes on the wire).
+//
+// step function and let the compiler instantiate it for both. The Session
+// does not change and does not know about TLS.
 //
 // The SCRAM client nonce is drawn from the OS randomness here, at the edge —
 // the pure core never touches randomness.
@@ -17,30 +35,46 @@ module postgres.pgnet
 
 import std.net.{TcpStream, NetError}
 import std.encoding.base64.{Base64}
-import tls.{TlsStream, ClientConfig, VerificationMode, TlsError, TlsVersion}
-import postgres.{Session, SessionPhase, PgEvent, ParamValue, PostgresError, ErrorField, Auth, ClientMessage, Ready, SslAnswer}
+import postgres.{Session, SessionPhase, PgEvent, ParamValue, PostgresError, ErrorField, Auth, ClientMessage, QueryError, Ready, SslAnswer, TlsRefused}
 
-/// Whether and how to ask for TLS (SSLRequest negotiation, «SSL Session
-/// Encryption»). The verification mode is nova-tls's own type; the name
-/// checked against the certificate is the `host` from [`ConnectOptions`].
-export type TlsMode enum
-    /// Never send SSLRequest; connect in plaintext.
-    | Disable
-    /// Send SSLRequest; on 'N' continue in plaintext.
-    | Prefer(VerificationMode)
-    /// Send SSLRequest; on 'N' fail with [`ConnError.RefusedTls`].
-    | Require(VerificationMode)
+/// (Slice Д8в criterion 2 names TlsMode - Disable/Prefer/Require. The
+/// MODE TYPE lives in the consumer's entry module: this compiler breaks
+/// the ABI of third-party (git) package types on any cross-module
+/// boundary (repro-local/tls_handshake: a tls value produced in one
+/// module and used in another segfaults or corrupts), so pgnet imports
+/// nova-tls types nowhere. The negotiation itself is the pure
+/// [`SslAnswer.classify`] in the postgres module plus the byte-level
+/// [`request_ssl`] here; the TLS handshake and the encrypted transport
+/// are composed in the entry module, where tls types are sound - see
+/// examples/live.)
 
-/// Connection parameters as a record (slice Д8в replaces the five
-/// positional strings of Д8б).
+/// Connection parameters as a record — usable inside this package and by
+/// consumers that do not cross the boundary with it (see the note below).
 export type ConnectOptions value {
     ro host str
     ro port int
     ro user str
     ro password str
     ro database str
-    ro tls TlsMode
+    /// The name checked against the server's certificate (SNI + hostname
+    /// verification). Empty = the `host`.
+    ro tls_server_name str
 }
+
+/// The name checked against the certificate for these options: the
+/// explicit override, or the TCP host.
+export fn ConnectOptions @cert_server_name() -> str {
+    if @tls_server_name == "" { @host } else { @tls_server_name }
+}
+
+// (Slice Д8в criterion 4 names a ConnectOptions record. Records do not
+// cross module boundaries soundly in this compiler — a foreign record's
+// schema is not registered in the consumer's unit (observed live:
+// `unknown type name Nova_postgres_pgnet_ConnectOptions`, then member
+// access on an int; same family as repro-local/enum_consume_socket). The
+// adapter therefore takes plain scalars — the shape D8b proved cross-
+// module — and the record idea is left to the owner with the rest of the
+// cross-module type work.)
 
 /// The structured adapter error (slice Д8в criterion 3): every failure
 /// branch is distinguishable by VARIANT, the message text is not the only
@@ -51,10 +85,11 @@ export type ConnectOptions value {
 export type ConnError enum
     /// Transport read/write on the plain socket.
     | Net { error NetError }
-    /// TLS handshake or encrypted I/O; `error` is the TlsError, its kind
-    /// tells certificate/hostname/protocol/transport failures apart.
-    | Tls { error TlsError }
-    /// The server answered 'N' to SSLRequest under [`TlsMode.Require`].
+    /// Placeholder for TLS failures in callers that match ConnError
+    /// alongside their own TLS error type (pgnet keeps no tls types; see
+    /// the module banner).
+    | TlsUnavailable
+    /// The server answered 'N' to SSLRequest while TLS was required.
     | RefusedTls
     /// A protocol violation (decoder or session state machine).
     | Protocol { error PostgresError }
@@ -68,7 +103,7 @@ export type ConnError enum
 export fn ConnError @to_str() -> str =>
     match @ {
         Net { error } => "network: ${error}"
-        Tls { error } => "tls: ${error}"
+        TlsUnavailable => "tls error (see the caller's TLS error type)"
         RefusedTls => "server refused TLS (Require)"
         Protocol { error } => "${error}"
         Auth { error } => "${error}"
@@ -85,66 +120,159 @@ fn server_message(fields []ErrorField) -> str {
     ""
 }
 
-/// The connection's byte stream: plain TCP or TLS. Reads and writes
-/// dispatch on it; the Session above is identical either way. A consume
-/// type: constructing a variant is what consumes the socket, and no copy
-/// of a stream can ever exist.
-export type ConnStream consume enum
-    | Plain(TcpStream)
-    | Tls(TlsStream)
+/// Constructor for [`ConnectOptions`].
+export fn connect_options(host str, port int, user str, password str, database str) -> ConnectOptions =>
+    { host, port, user, password, database }
 
-/// A live PostgreSQL connection. A consume type, like its parts (D131):
-/// created by [`connect`], stepped by the query methods, ended exactly once
-/// by [`Connection @close`] or by the scope-exit cleanup.
+/// Step 1: open the TCP connection.
+export fn open_tcp(host str, port int) Net -> Result[TcpStream, ConnError] {
+    ro addr = "${host}:${port}"
+    match TcpStream.connect(addr) {
+        Ok(consume s) => Ok(s)
+        Err(e) => Err(ConnError.Net { error: e })
+    }
+}
+
+/// Step 2 (skip under TlsMode.Disable): send SSLRequest over the socket
+/// (taken as an in-out parameter — it stays in the caller's binding) and
+/// classify the server's single answer byte with the pure
+/// [`SslAnswer.classify`] — 'S' (TLS on this socket), 'N' (plaintext
+/// continues), ANY other byte (including 'E', an old server's
+/// ErrorResponse tag) a structured protocol error. On an early return the
+/// caller's consume binding closes the socket through its auto-@cleanup;
+/// on Ok the caller keeps the socket and moves it into connect_tls or
+/// connect_plain per the answer.
+export fn request_ssl(mut stream TcpStream) Net -> Result[SslAnswer, ConnError] {
+    match stream.write_all(ClientMessage.ssl_request()) {
+        Ok(()) => ()
+        Err(e) => return Err(ConnError.Net { error: e })
+    }
+    ro answer = match stream.read_bytes(1) {
+        Ok(b) => b
+        Err(e) => return Err(ConnError.Net { error: e })
+    }
+    if answer.len() == 0 {
+        ro pe = PostgresError { kind: Protocol { what: "server closed the connection without answering SSLRequest" } }
+        return Err(ConnError.Protocol { error: pe })
+    }
+    match SslAnswer.classify(answer[0]) {
+        Err(pe) => Err(ConnError.Protocol { error: pe })
+        Ok(a) => Ok(a)
+    }
+}
+
+/// Step 3: plaintext start-up over the open socket (TlsMode.Disable, or
+/// the 'N' fallback of TlsMode.Prefer decided by the caller of the step
+/// API).
+export fn connect_plain(consume stream TcpStream, user str, password str, database str) Net Random -> Result[Connection, ConnError] {
+    consume conn = Connection {
+        stream,
+        session: Session.new(user, password, database, Base64.encode(Random.bytes(18))),
+    }
+    start_plain(conn)
+}
+
+/// A plaintext PostgreSQL connection. A consume type, like its parts
+/// (D131): stepped by the query methods, ended exactly once by
+/// [`Connection @close`] or by the scope-exit cleanup.
 export type Connection consume {
-    consume stream ConnStream
+    consume stream TcpStream
     consume session Session
 }
 
-/// Connect per `options`: open TCP, negotiate TLS per the mode (Disable —
-/// no SSLRequest; Prefer/Require — SSLRequest, then 'S' -> TlsStream over
-/// the same socket, 'N' -> plaintext or RefusedTls, any other byte -> a
-/// structured protocol error), then run the start-up phase
-/// (StartupMessage, authentication — trust, cleartext, MD5, SCRAM-SHA-256,
-/// ParameterStatus/BackendKeyData, up to the first ReadyForQuery).
-///
-/// Start-up failures are structured: an auth-phase ErrorResponse is
-/// [`ConnError.Auth`] (28P01 etc.), a post-auth ErrorResponse is
-/// [`ConnError.Server`], anything else [`ConnError.Protocol`]. The pure
-/// negotiation byte-classification lives in the postgres module
-/// ([`SslAnswer.classify`]).
-export fn connect(options ConnectOptions) Net Random -> Result[Connection, ConnError] {
-    ro addr = "${options.host}:${options.port}"
-    consume stream = match TcpStream.connect(addr) {
-        Ok(consume s) => s
-        Err(e) => return Err(ConnError.Net { error: e })
-    }
-    // Bound once: the negotiation replaces the plain stream with a
-    // TlsStream (or keeps it) inside a single consume binding, so the
-    // auto-@cleanup (D432) can never see a half-negotiated value.
-    consume wrapped = match options.tls {
-        Disable => ConnStream.Plain(stream)
-        Prefer(mode) => negotiate(stream, options.host, mode, false)?
-        Require(mode) => negotiate(stream, options.host, mode, true)?
-    }
-    consume conn = Connection {
-        stream: wrapped,
-        session: Session.new(options.user, options.password, options.database, Base64.encode(Random.bytes(18))),
-    }
-    // conn is consumed inside startup_result on the failure paths (its
-    // final flush is sent before the error returns); on the error path of
-    // pump it is left unconsumed and the auto-@cleanup closes it politely.
-    ro r = match conn.pump() {
-        Ok(evs) => startup_result(conn, evs)
-        Err(e) => Err(e)
-    }
-    r
+// ──────────────────────────────────────────────────────────────────────────
+// The identical method surface on both connection types, delegating to the
+// generic implementations below.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Run one simple-protocol query and return every event up to (excluding)
+/// the ReadyForQuery that closes the cycle. A server ErrorResponse is one
+/// of the events (QueryError carries the SQLSTATE); the connection stays
+/// usable.
+export fn Connection mut @simple_query(q str) Net -> Result[[]PgEvent, ConnError] =>
+    simple_query_plain(@, q)
+
+/// Run one extended-protocol cycle (Parse/Bind/Describe/Execute/Sync,
+/// unnamed statement and portal, text formats on both sides) with
+/// `params` — SQL NULL as ParamValue.null().
+export fn Connection mut @extended_query(sql str, params []ParamValue) Net -> Result[[]PgEvent, ConnError] =>
+    extended_query_plain(@, sql, params)
+
+/// Transaction-status byte of the last ReadyForQuery (`I`/`T`/`E`).
+export fn Connection @transaction_status() -> u8 =>
+    @session.transaction_status()
+
+/// Close politely: send everything the session still owes (Terminate last)
+/// and end the connection. Consumes it — after this call the connection
+/// cannot be used; the socket closes at scope end on its own auto-cleanup,
+/// same as the D8a smoke.
+export fn Connection consume @close() Net -> Result[(), ConnError] {
+    ro fin = @session.close()
+    write_stream(@stream, fin)
 }
 
-// Startup-phase validation: a QueryError event means the server answered
-// the start-up with an ErrorResponse (structured Server error, SQLSTATE +
-// fields); anything but a Ready session afterwards is a protocol failure.
-fn startup_result(consume conn Connection, evs []PgEvent) -> Result[Connection, ConnError] {
+/// Same over TLS.
+/// Same over TLS.
+/// Scope-exit cleanup (D432): a connection bound as `consume conn = …`
+/// and left unconsumed — an early return, a forgotten close — is closed
+/// politely at scope exit; the final flush (Terminate) still reaches the
+/// server. Explicit [`@close`] remains for callers that want to observe
+/// the write error.
+export fn Connection consume @cleanup(_outcome ScopeOutcome) Net -> () {
+    ro _r = @close()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Per-transport implementations. The bodies are identical by design; they
+// are duplicated because a generic over the connection type does not
+// monomorphize field access on the type parameter in this compiler
+// (codegen: no matching overload for the stream access). One type, one
+// pump - boring and predictable.
+// ──────────────────────────────────────────────────────────────────────────
+
+fn simple_query_plain(mut conn Connection, q str) Net -> Result[[]PgEvent, ConnError] {
+    match conn.session.query(q) {
+        Ok(()) => ()
+        Err(e) => return Err(ConnError.Protocol { error: e })
+    }
+    pump_plain(conn)
+}
+
+fn extended_query_plain(mut conn Connection, sql str, params []ParamValue) Net -> Result[[]PgEvent, ConnError] {
+    match conn.session.query_extended(sql, [], params, []) {
+        Ok(()) => ()
+        Err(e) => return Err(ConnError.Protocol { error: e })
+    }
+    pump_plain(conn)
+}
+
+fn write_stream(mut s TcpStream, data []u8) Net -> Result[(), ConnError] {
+    match s.write_all(data) {
+        Ok(()) => Ok(())
+        Err(e) => Err(ConnError.Net { error: e })
+    }
+}
+
+fn read_stream(mut s TcpStream, max int) Net -> Result[[]u8, ConnError] {
+    match s.read_bytes(max) {
+        Ok(b) => Ok(b)
+        Err(e) => Err(ConnError.Net { error: e })
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Start-up and the query pump - one concrete pair per transport
+// ──────────────────────────────────────────────────────────────────────────
+
+fn start_plain(consume conn Connection) Net -> Result[Connection, ConnError] {
+    ro evs = match pump_plain(conn) {
+        Ok(e) => e
+        Err(e) => return Err(e)
+    }
+    startup_check_plain(conn, evs)
+}
+
+fn startup_check_plain(consume conn Connection, evs []PgEvent) Net -> Result[Connection, ConnError] {
     mut i = 0
     while i < evs.len() {
         match evs[i] {
@@ -164,176 +292,19 @@ fn startup_result(consume conn Connection, evs []PgEvent) -> Result[Connection, 
     Ok(conn)
 }
 
-// The SSLRequest negotiation over a fresh socket. `required` = Require
-// (on 'N' — RefusedTls); false = Prefer (on 'N' — plaintext). On any
-// failure the socket closes inside (TlsStream.connect closes on handshake
-// error; the consume binding auto-cleans otherwise).
-fn negotiate(consume stream TcpStream, host str, mode VerificationMode, required bool) Net -> Result[ConnStream, ConnError] {
-    // The consume block owns the socket (D188, the same one-shot pattern
-    // TlsStream.connect documents): every early `return` closes it through
-    // the block's auto-@cleanup; the success paths move it into the
-    // matching ConnStream variant (TlsStream.connect takes it on the TLS
-    // path, closing on handshake failure itself).
-    consume stream {
-        match stream.write_all(ClientMessage.ssl_request()) {
-            Ok(()) => ()
-            Err(e) => return Err(ConnError.Net { error: e })
-        }
-        ro answer = match stream.read_bytes(1) {
-            Ok(b) => b
-            Err(e) => return Err(ConnError.Net { error: e })
-        }
-        if answer.len() == 0 {
-            ro pe = PostgresError { kind: Protocol { what: "server closed the connection without answering SSLRequest" } }
-            return Err(ConnError.Protocol { error: pe })
-        }
-        match SslAnswer.classify(answer[0]) {
-            Err(pe) => return Err(ConnError.Protocol { error: pe })
-            Ok(TlsRefused) => {
-                if required {
-                    return Err(ConnError.RefusedTls)
-                }
-                ro w = ConnStream.Plain(stream)
-                return Ok(w)
-            }
-            Ok(TlsSupported) => {
-                mut cfg = ClientConfig.new(host)
-                cfg.alpn_protocols([])
-                cfg.verification(mode)
-                // The block can only move `stream` out as itself, so the
-                // handshake takes a @share() handle (rc-shared; the block
-                // cleanup closing our handle does not close the socket
-                // under the TlsStream).
-                match TlsStream.connect(stream.share(), cfg) {
-                    Ok(consume ts) => {
-                        // The D133 checker counts enum-variant construction
-                        // only from a consume-block binding (not from a
-                        // pattern binding), so the payload goes through a
-                        // re-consume block — the same shape the socket got.
-                        consume ts {
-                            ro w = ConnStream.Tls(ts)
-                            return Ok(w)
-                        }
-                    }
-                    Err(e) => return Err(ConnError.Tls { error: e })
-                }
-            }
-        }
-    }
-}
-
-
-/// Run one simple-protocol query and return every event up to (excluding)
-/// the ReadyForQuery that closes the cycle. A server ErrorResponse is one
-/// of the events (QueryError carries the SQLSTATE); the connection stays
-/// usable.
-export fn Connection mut @simple_query(q str) Net -> Result[[]PgEvent, ConnError] {
-    match @session.query(q) {
-        Ok(()) => ()
-        Err(e) => return Err(ConnError.Protocol { error: e })
-    }
-    @pump()
-}
-
-/// Run one extended-protocol cycle (Parse/Bind/Describe/Execute/Sync, unnamed
-/// statement and portal, text formats on both sides) with `params` — SQL NULL
-/// as ParamValue.null(). Returns the events before the closing ReadyForQuery.
-export fn Connection mut @extended_query(sql str, params []ParamValue) Net -> Result[[]PgEvent, ConnError] {
-    match @session.query_extended(sql, [], params, []) {
-        Ok(()) => ()
-        Err(e) => return Err(ConnError.Protocol { error: e })
-    }
-    @pump()
-}
-
-/// Transaction-status byte of the last ReadyForQuery (`I`/`T`/`E`).
-export fn Connection @transaction_status() -> u8 =>
-    @session.transaction_status()
-
-/// The negotiated TLS version, if the stream is TLS.
-export fn Connection mut @tls_version() -> Option[TlsVersion] =>
-    stream_tls_version(@stream)
-
-/// Close politely: send everything the session still owes (Terminate last)
-/// and end the connection. Consumes it — after this call the connection
-/// cannot be used; the socket (and the TLS session, with its close_notify)
-/// closes at scope end on its own auto-cleanup, same as the D8a smoke.
-export fn Connection consume @close() Net -> Result[(), ConnError] {
-    ro fin = @session.close()
-    stream_write(@stream, fin)
-}
-
-/// Scope-exit cleanup (D432): a `Connection` bound as `consume conn = …`
-/// and left unconsumed — an early return out of connect, a forgotten close
-/// in a consumer — is closed politely at scope exit; the final flush
-/// (Terminate) still reaches the server. Explicit [`@close`] remains for
-/// callers that want to observe the write error.
-export fn Connection consume @cleanup(_outcome ScopeOutcome) Net -> () {
-    ro _r = @close()
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Stream dispatch: every read and write goes through the one stream
-// ──────────────────────────────────────────────────────────────────────────
-
-// The helpers take the stream as a `mut` parameter rather than matching on
-// the field: matching a consume payload out of `self` would move it, and a
-// mut parameter keeps the dispatch in one place. TcpStream/TlsStream are
-// handle-based; the parameter shares the live stream.
-
-fn stream_write(mut s ConnStream, data []u8) Net -> Result[(), ConnError] {
-    match s {
-        Plain(p) => match p.write_all(data) {
-            Ok(()) => Ok(())
-            Err(e) => Err(ConnError.Net { error: e })
-        }
-        Tls(t) => match t.write_all(data) {
-            Ok(()) => Ok(())
-            Err(e) => Err(ConnError.Tls { error: e })
-        }
-    }
-}
-
-fn stream_read(mut s ConnStream, max int) Net -> Result[[]u8, ConnError] {
-    match s {
-        Plain(p) => match p.read_bytes(max) {
-            Ok(b) => Ok(b)
-            Err(e) => Err(ConnError.Net { error: e })
-        }
-        Tls(t) => match t.read_bytes(max) {
-            Ok(b) => Ok(b)
-            Err(e) => Err(ConnError.Tls { error: e })
-        }
-    }
-}
-
-fn stream_tls_version(mut s ConnStream) -> Option[TlsVersion] {
-    match s {
-        Plain(_) => None
-        Tls(t) => t.protocol_version()
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Pump: outbound bytes out, inbound bytes in, until ReadyForQuery
-// ──────────────────────────────────────────────────────────────────────────
-
-// One query round: drain the session to the stream, feed stream bytes back
-// until the Ready event arrives. The incremental decoder makes the chunk
-// size an implementation detail — any read size works.
-fn Connection mut @pump() Net -> Result[[]PgEvent, ConnError] {
+fn pump_plain(mut conn Connection) Net -> Result[[]PgEvent, ConnError] {
     mut events []PgEvent = []PgEvent.new()
     while true {
-        ro out = @session.drain()
+        ro out = conn.session.drain()
         if out.len() > 0 {
-            stream_write(@stream, out)?
+            write_stream(conn.stream, out)?
         }
-        ro chunk = stream_read(@stream, 65536)?
+        ro chunk = read_stream(conn.stream, 65536)?
         if chunk.len() == 0 {
             ro pe = PostgresError { kind: Protocol { what: "server closed the connection" } }
             return Err(ConnError.Protocol { error: pe })
         }
-        ro evs = match @session.feed(chunk) {
+        ro evs = match conn.session.feed(chunk) {
             Ok(e) => e
             Err(e) => return Err(session_error(e))
         }
