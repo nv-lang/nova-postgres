@@ -93,6 +93,9 @@ fn run(host str, port int, mode str, argv []str) Fs Net Random -> Result[str, st
         ro name = argv.get(5) ?? host
         return expect_tls_ca_error(host, port, VerificationMode.SystemRoots, name)
     }
+    if mode == "rowerr" {
+        return row_stream_error_recovery(host, port)
+    }
     if mode == "require" {
         return expect_refused(host, port)
     }
@@ -410,11 +413,65 @@ fn expect_tls_ca_error(host str, port int, verify VerificationMode, server_name 
     }
 }
 
+// A server error (SQLSTATE) through the row stream leaves the connection
+// usable: next() reports 42601 structurally, @close drains to the cycle
+// end and returns the connection, and the next query works.
+fn row_stream_error_recovery(host str, port int) Net Random -> Result[str, str] {
+    consume conn = match connect_plain(match open_tcp(host, port) {
+        Ok(consume s) => s
+        Err(e) => return Err("tcp: ${e}")
+    }, "postgres", "smoke", "postgres") {
+        Ok(consume c) => c
+        Err(e) => return Err("connect: ${e}")
+    }
+    consume rows = match row_stream(conn, "SELEC bogus") {
+        Ok(consume r) => r
+        Err(e) => return Err("row_stream: ${e}")
+    }
+    ro sqlstate = match rows.next() {
+        Err(ConnError.Server { sqlstate, .. }) => sqlstate
+        Err(e) => return Err("wrong error variant: ${e}")
+        Ok(_) => return Err("a syntax error produced a row")
+    }
+    if sqlstate != "42601" {
+        return Err("expected SQLSTATE 42601, got '${sqlstate}'")
+    }
+    println("live: row stream surfaced SQLSTATE ${sqlstate}")
+    // The connection comes back usable after a server error.
+    consume conn2 = match rows.close() {
+        Ok(consume c) => c
+        Err(e) => return Err("close: ${e}")
+    }
+    ro one = plain_text_value2(conn2, "SELECT 1")?
+    if one != "1" {
+        return Err("connection after the server error answered '${one}'")
+    }
+    println("live: same connection after the server error -> '${one}'")
+    match conn2.close() {
+        Ok(()) => ()
+        Err(e) => return Err("close: ${e}")
+    }
+    Ok("RowStream: server error 42601 surfaced structurally, connection recovered")
+}
+
+fn plain_text_value2(mut conn Connection, sql str) Net -> Result[str, str] {
+    ro evs = match conn.simple_query(sql) {
+        Ok(e) => e
+        Err(e) => return Err("${e}")
+    }
+    first_text_value(evs, "select 1")
+}
+
 // (d, Require): the plain server refuses TLS — the structured refusal.
 
 // (d, Prefer): 'N' -> plaintext fallback through pgnet, pg_stat_ssl -> f.
 
 // (d, Disable): no SSLRequest on the wire at all, plaintext via pgnet.
+
+// A server error (SQLSTATE) through the row stream leaves the connection
+// usable: next() reports 42601 structurally, @close drains to the cycle
+// end and returns the connection, and the next query works.
+
 
 // (d, Require): the plain server refuses TLS — the structured refusal.
 fn expect_refused(host str, port int) Net Random -> Result[str, str] {

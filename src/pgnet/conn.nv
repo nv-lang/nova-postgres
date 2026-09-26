@@ -295,8 +295,13 @@ export fn RowStream mut @next() Net -> Result[Option[PgEvent], ConnError] {
 /// cleanly and the session is Ready) and give the connection back for
 /// the next query — the same thing database/sql's Rows.Close does
 /// internally. The abnormal ending is [`RowStream @abort`]. If draining
-/// fails, the connection is closed before the error returns — a dead
-/// stream never leaves the socket unterminated.
+/// fails the error decides: a server error (SQLSTATE) is an
+/// application-level failure — the server recovers on its own (skips to
+/// ReadyForQuery), so the stream keeps draining to the cycle end and the
+/// connection comes back usable; anything else (transport, protocol,
+/// auth, refused TLS) means the connection is dead — it is closed before
+/// the error returns. Either way a stream that dies with ownership never
+/// leaves the socket unterminated.
 export fn RowStream consume @close() Net -> Result[Connection, ConnError] {
     mut done = false
     // Typed binding on purpose: a bare `None` literal infers as
@@ -307,15 +312,27 @@ export fn RowStream consume @close() Net -> Result[Connection, ConnError] {
             Ok(Some(_)) => ()
             Ok(None) => { done = true }
             Err(e) => {
-                done = true
-                failed = Some(e)
+                // Server errors leave the connection usable — keep
+                // draining to ReadyForQuery and report them at the end.
+                match e {
+                    ConnError.Server { .. } => { failed = Some(e) }
+                    _ => {
+                        done = true
+                        failed = Some(e)
+                    }
+                }
             }
         }
     }
     match failed {
         Some(e) => {
-            ro _c = @conn.close()
-            Err(e)
+            match e {
+                ConnError.Server { .. } => Err(e)
+                _ => {
+                    ro _c = @conn.close()
+                    Err(e)
+                }
+            }
         }
         None => Ok(@conn)
     }
