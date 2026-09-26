@@ -229,10 +229,7 @@ fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mo
     consume session = Session.new("postgres", "smoke", "postgres", Base64.encode(Random.bytes(18)))
     // Start-up phase over TLS: the StartupMessage goes out on the first
     // pump; a QueryError here means the server refused the start-up.
-    ro evs = match pump_tls(ts, session) {
-        Ok(e) => e
-        Err(e) => return Err(e)
-    }
+    ro evs = pump_tls(ts, session)?
     for e in evs {
         match e {
             QueryError { sqlstate, message } => return Err("server error ${sqlstate}: ${message}")
