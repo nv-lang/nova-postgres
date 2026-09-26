@@ -181,8 +181,7 @@ export type Connection consume {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// The identical method surface on both connection types, delegating to the
-// generic implementations below.
+// The connection's method surface, delegating to the implementations below.
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Run one simple-protocol query and return every event up to (excluding)
@@ -211,8 +210,6 @@ export fn Connection consume @close() Net -> Result[(), ConnError] {
     write_stream(@stream, fin)
 }
 
-/// Same over TLS.
-/// Same over TLS.
 /// Scope-exit cleanup (D432): a connection bound as `consume conn = …`
 /// and left unconsumed — an early return, a forgotten close — is closed
 /// politely at scope exit; the final flush (Terminate) still reaches the
@@ -220,6 +217,89 @@ export fn Connection consume @close() Net -> Result[(), ConnError] {
 /// the write error.
 export fn Connection consume @cleanup(_outcome ScopeOutcome) Net -> () {
     ro _r = @close()
+}
+
+/// A cursor over the rows of one query. The next row is pulled AT RUNTIME
+/// by [`RowStream @next`]: the stream drains the session to the socket and
+/// reads only as many bytes as the next row needs — nothing is collected
+/// up front, so a million-row answer costs one row of memory. A consume
+/// type: the connection moves into the stream and comes back out of
+/// [`RowStream @finish`].
+export type RowStream consume {
+    consume conn Connection
+    mut pending []PgEvent
+    mut pos int
+}
+
+/// Start a simple query and take the connection into a row stream. The
+/// connection is consumed until [`RowStream @finish`] returns it.
+export fn row_stream(consume conn Connection, q str) Net -> Result[RowStream, ConnError] {
+    match conn.session.query(q) {
+        Ok(()) => ()
+        Err(e) => return Err(ConnError.Protocol { error: e })
+    }
+    consume rows = RowStream { conn, pending: []PgEvent.new(), pos: 0 }
+    Ok(rows)
+}
+
+/// The next row at runtime: `Ok(Some(Row { values }))` per DataRow,
+/// `Ok(None)` at the ReadyForQuery that closes the cycle. Non-row events
+/// (RowDescription, CommandComplete, EmptyQuery, Notice) are consumed
+/// inside; a QueryError surfaces as [`ConnError.Server`] with its
+/// SQLSTATE and fields. Socket bytes are read only when no decoded event
+/// is buffered.
+export fn RowStream mut @next() Net -> Result[Option[PgEvent], ConnError] {
+    while true {
+        if @pos < @pending.len() {
+            ro e = @pending[@pos]
+            @pos += 1
+            // Kind test without destructuring: reconstructing Some(Row{..})
+            // here made the mono collector emit a SECOND C type for PgEvent
+            // (Option<Event2> vs Option<PgEvent> mismatch at the call
+            // boundary). The original value is returned as-is.
+            if is_row_event(e) {
+                return Ok(Some(e))
+            }
+            match e {
+                Ready { .. } => return Ok(None)
+                QueryError { sqlstate, fields } => return Err(ConnError.Server { sqlstate, fields })
+                _ => ()
+            }
+        } else {
+            @pending.truncate(0)
+            @pos = 0
+            ro out = @conn.session.drain()
+            if out.len() > 0 {
+                write_stream(@conn.stream, out)?
+            }
+            ro chunk = read_stream(@conn.stream, 65536)?
+            if chunk.len() == 0 {
+                ro pe = PostgresError { kind: Protocol { what: "server closed the connection" } }
+                return Err(ConnError.Protocol { error: pe })
+            }
+            ro evs = match @conn.session.feed(chunk) {
+                Ok(e) => e
+                Err(e) => return Err(session_error(e))
+            }
+            @pending.append(evs)
+        }
+    }
+    Ok(None)
+}
+
+/// Give the connection back. Drains the rest of the answer first (rows
+/// not pulled by the caller are read and dropped), so the session is
+/// Ready for the next query.
+export fn RowStream consume @finish() Net -> Result[Connection, ConnError] {
+    mut done = false
+    while !done {
+        match @next() {
+            Ok(Some(_)) => ()
+            Ok(None) => { done = true }
+            Err(e) => return Err(e)
+        }
+    }
+    Ok(@conn)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -324,6 +404,15 @@ fn pump_plain(mut conn Connection) Net -> Result[[]PgEvent, ConnError] {
     Ok(events)
 }
 
+// Kind test for the row stream (no payload destructuring — see the note
+// in RowStream @next).
+fn is_row_event(e PgEvent) -> bool {
+    match e {
+        Row { .. } => true
+        _ => false
+    }
+}
+
 // A session/decoder failure classified for the adapter: an Auth kind means
 // the server rejected authentication; anything else is a protocol failure.
 fn session_error(e PostgresError) -> ConnError {
@@ -332,3 +421,5 @@ fn session_error(e PostgresError) -> ConnError {
         _ => ConnError.Protocol { error: e }
     }
 }
+
+// cache-probe-touch

@@ -51,7 +51,7 @@ import std.fs.{real_fs, read, Path}
 import std.encoding.base64.{Base64}
 import tls.{TlsStream, ClientConfig, VerificationMode, TlsError, TlsVersion, Tls12, Tls13}
 import postgres.{Session, SessionPhase, PgEvent, ParamValue, Row, QueryError, Ready, ClientMessage, ErrorField, SslAnswer, TlsSupported, TlsRefused}
-import postgres.pgnet.{ConnError, open_tcp, connect_plain, Connection}
+import postgres.pgnet.{ConnError, open_tcp, connect_plain, row_stream, Connection}
 
 /// Whether and how to ask for TLS — slice Д8в criterion 2's TlsMode. It
 /// lives in the entry module (see the banner): pgnet imports no tls types.
@@ -480,15 +480,8 @@ fn plaintext_fallback(host str, port int, verify VerificationMode, what str) Net
         Ok(consume c) => c
         Err(e) => return Err("connect: ${e}")
     }
-    ro ssl = plain_text_value(conn, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", "ssl check")?
-    if ssl != "f" {
-        return Err("${what}: pg_stat_ssl.ssl expected 'f', got '${ssl}'")
-    }
+    ro ssl = plain_ssl_value(conn)?
     println("live: ${what} -> plaintext (pg_stat_ssl -> f)")
-    match conn.close() {
-        Ok(()) => ()
-        Err(e) => return Err("close: ${e}")
-    }
     Ok("${what} fell back to plaintext, pg_stat_ssl -> f")
 }
 
@@ -501,15 +494,8 @@ fn plaintext_disable(host str, port int) Net Random -> Result[str, str] {
         Ok(consume c) => c
         Err(e) => return Err("connect: ${e}")
     }
-    ro ssl = plain_text_value(conn, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", "ssl check")?
-    if ssl != "f" {
-        return Err("Disable: pg_stat_ssl.ssl expected 'f', got '${ssl}'")
-    }
+    ro ssl = plain_ssl_value(conn)?
     println("live: Disable -> plaintext, no SSLRequest (pg_stat_ssl -> f)")
-    match conn.close() {
-        Ok(()) => ()
-        Err(e) => return Err("close: ${e}")
-    }
     Ok("Disable stayed in plaintext, pg_stat_ssl -> f")
 }
 
@@ -524,12 +510,44 @@ fn single_text_value(mut stream TlsStream, mut session Session, sql str, what st
     first_text_value(evs, what)
 }
 
-fn plain_text_value(mut conn Connection, sql str, what str) Net -> Result[str, str] {
-    ro evs = match conn.simple_query(sql) {
-        Ok(e) => e
+// The ssl value pulled through the row-stream API: one row, one next().
+fn plain_ssl_value(consume conn Connection) Net -> Result[str, str] {
+    consume rows = match row_stream(conn, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()") {
+        Ok(consume r) => r
         Err(e) => return Err("${e}")
     }
-    first_text_value(evs, what)
+    ro val = match rows.next() {
+        Ok(Some(Row { values })) => {
+            if values.len() < 1 {
+                return Err("ssl row has no columns")
+            }
+            ro v = values[0]
+            match v.data {
+                Some(b) => {
+                    match b.to_str() {
+                        Ok(t) => t
+                        Err(_) => return Err("ssl value is not UTF-8")
+                    }
+                }
+                None => return Err("ssl value is NULL")
+            }
+        }
+        Ok(Some(_)) => return Err("ssl row is not a DataRow")
+        Ok(None) => return Err("no row in the answer")
+        Err(e) => return Err("${e}")
+    }
+    consume conn2 = match rows.finish() {
+        Ok(consume c) => c
+        Err(e) => return Err("${e}")
+    }
+    match conn2.close() {
+        Ok(()) => ()
+        Err(e) => return Err("close: ${e}")
+    }
+    if val != "f" {
+        return Err("pg_stat_ssl.ssl expected 'f', got '${val}'")
+    }
+    Ok(val)
 }
 
 fn first_text_value(evs []PgEvent, what str) -> Result[str, str] {
