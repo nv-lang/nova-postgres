@@ -96,7 +96,7 @@ export type ConnError enum
     /// The server rejected authentication (SQLSTATE 28P01 and friends).
     | Auth { error PostgresError }
     /// An ErrorResponse during the start-up phase: SQLSTATE + raw fields.
-    | Server { sqlstate str, fields []ErrorField }
+    | Server { sqlstate str, message str }
 
 /// Human-readable, single-line description (for logs; match the VARIANT to
 /// branch on meaning).
@@ -107,22 +107,30 @@ export fn ConnError @to_str() -> str =>
         RefusedTls => "server refused TLS (Require)"
         Protocol { error } => "${error}"
         Auth { error } => "${error}"
-        Server { sqlstate, fields } => "server error ${sqlstate}: ${server_message(fields)}"
+        Server { sqlstate, message } => "server error ${sqlstate}: ${message}"
     }
 
-// ErrorResponse field `M`.
-fn server_message(fields []ErrorField) -> str {
-    for f in fields {
-        if f.code == 'M' as u8 {
-            return f.value
-        }
-    }
-    ""
-}
+// Build the Server variant from the event's pre-rendered parts. The
+// []ErrorField vec never crosses into the adapter's error state: vecs
+// inside enum payloads are the mono shape that corrupts the heap in this
+// compilation unit (repro-local/query_error_live).
+fn server_error(sqlstate str, message str) -> ConnError =>
+    ConnError.Server { sqlstate, message }
 
 /// Constructor for [`ConnectOptions`].
 export fn connect_options(host str, port int, user str, password str, database str) -> ConnectOptions =>
     { host, port, user, password, database }
+
+/// One-call plaintext connect: TCP, then the start-up phase. The
+/// convenience wrapper over open_tcp + connect_plain for the common
+/// case (no TLS negotiation).
+export fn connect(host str, port int, user str, password str, database str) Net Random -> Result[Connection, ConnError] {
+    consume stream = match open_tcp(host, port) {
+        Ok(consume s) => s
+        Err(e) => return Err(e)
+    }
+    connect_plain(stream, user, password, database)
+}
 
 /// Step 1: open the TCP connection.
 export fn open_tcp(host str, port int) Net -> Result[TcpStream, ConnError] {
@@ -168,6 +176,7 @@ export fn connect_plain(consume stream TcpStream, user str, password str, databa
     consume conn = Connection {
         stream,
         session: Session.new(user, password, database, Base64.encode(Random.bytes(18))),
+        iter: ConnIter { pending: []PgEvent.new(), pos: 0, err: ConnError.TlsUnavailable, err_set: false, done: true },
     }
     start_plain(conn)
 }
@@ -175,9 +184,37 @@ export fn connect_plain(consume stream TcpStream, user str, password str, databa
 /// A plaintext PostgreSQL connection. A consume type, like its parts
 /// (D131): stepped by the query methods, ended exactly once by
 /// [`Connection @close`] or by the scope-exit cleanup.
+/// Iteration state of the connection's row cursor: decoded events not
+/// yet delivered, the cursor position in them, and the error that ended
+/// the last iteration. A consume type so Connection keeps its all-
+/// consume field shape across module boundaries.
+export type ConnIter consume {
+    mut pending []PgEvent
+    mut pos int
+    /// The error that ended the last iteration. NOT Option[ConnError]:
+    /// an enum-with-payload inside Option, stored in a record field,
+    /// mis-lowers in the large live example TU and corrupts the heap
+    /// (a plain enum field + a set flag lowers soundly; measured: the
+    /// Option[ConnError] field crashed 11-18 of 15-20 runs).
+    mut err ConnError
+    /// Whether `err` carries the ended iteration's error.
+    mut err_set bool
+    /// True once the ReadyForQuery that closes the answer (or a fatal
+    /// error) was reached — further next() calls return None WITHOUT
+    /// touching the socket.
+    mut done bool
+}
+
+// Consumes the state when the connection is dropped. Nothing to
+// release — the marker exists so Connection keeps an all-consume field
+// shape, which is the layout this compiler lowers soundly across module
+// boundaries (mixed consume/plain record fields mis-layout).
+export fn ConnIter consume @discard() -> () {}
+
 export type Connection consume {
     consume stream TcpStream
     consume session Session
+    consume iter ConnIter
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -197,6 +234,199 @@ export fn Connection mut @simple_query(q str) Net -> Result[[]PgEvent, ConnError
 export fn Connection mut @extended_query(sql str, params []ParamValue) Net -> Result[[]PgEvent, ConnError] =>
     extended_query_plain(@, sql, params)
 
+/// Queue a simple-protocol query and turn the connection into a row
+/// cursor: pull rows with `for row in conn` / [`Connection @next`].
+/// Nothing is collected up front — socket bytes are read only as the
+/// next row needs them. The connection is NOT given away; the next
+/// query runs on it as soon as this answer is drained (explicitly via
+/// [`Connection @skip_answer`], or by iterating to the end).
+export fn Connection mut @query(q str) Net -> Result[(), ConnError] {
+    match @session.query(q) {
+        Ok(()) => ()
+        Err(e) => return Err(ConnError.Protocol { error: e })
+    }
+    @iter.pending.truncate(0)
+    @iter.pos = 0
+    @iter.err_set = false
+    @iter.done = false
+    Ok(())
+}
+
+// Remember the error that ended the iteration. A mut METHOD (not a plain
+// fn taking the record as a mut parameter, not an inline write at every
+// next() arm): both of those mis-lower in the large live example TU and
+// corrupt the heap - a mut-parameter record write does not land on the
+// caller's value (the known mut-param visibility defect), and an inline
+// payload-enum write in the big next() body corrupts adjacent memory
+// (measured: 6-18 crashes of 12-20 runs; the method form survives 20/20).
+export fn ConnIter mut @remember(e ConnError) -> () {
+    @err = e
+    @err_set = true
+}
+
+/// The next row at runtime: `Some(Row { values })` per DataRow, `None`
+/// at the ReadyForQuery that closes the cycle — directly iterable with
+/// `for row in conn { … }`. Non-row events are consumed inside. An
+/// error ENDS the iteration and is remembered for [`Connection @error`]:
+/// a server error (SQLSTATE) leaves the connection usable (drain the
+/// rest with skip_answer); anything else means it is dead.
+#impl(Next[PgEvent])
+export fn Connection mut @next() Net -> Option[PgEvent] {
+    if @iter.done {
+        return None
+    }
+    if @iter.err_set {
+        match @iter.err {
+            // A remembered server error does not block draining: the
+            // session skips to ReadyForQuery by itself, and the cursor
+            // must get there before the next query. Fatal errors stick.
+            ConnError.Server { .. } => ()
+            _ => {
+                @iter.done = true
+                return None
+            }
+        }
+    }
+    while true {
+        if @iter.pos < @iter.pending.len() {
+            ro e = @iter.pending[@iter.pos]
+            @iter.pos += 1
+            match @dispatch_event(e) {
+                Some(ev) => return Some(ev)
+                None => {
+                    if @iter.done {
+                        return None
+                    }
+                }
+            }
+        } else {
+            match @pump_once() {
+                Ok(()) => ()
+                Err(e) => {
+                    @iter.remember(e)
+                    @iter.done = true
+                    return None
+                }
+            }
+        }
+    }
+    None
+}
+
+// The socket half of one next() step: drain the session's outbound bytes,
+// write them, read one chunk, feed it, buffer the decoded events. A
+// separate small method - inlining this into next() mis-lowers in the
+// large live example TU once a QueryError event is in play and corrupts
+// the heap (repro-local/query_error_live; measured 15-20/15-20 segfaults,
+// this split form survives 20/20).
+fn Connection mut @pump_once() Net -> Result[(), ConnError] {
+    @iter.pending.truncate(0)
+    @iter.pos = 0
+    ro out = @session.drain()
+    if out.len() > 0 {
+        match write_stream(@stream, out) {
+            Ok(()) => ()
+            Err(e) => return Err(e)
+        }
+    }
+    ro chunk = match read_stream(@stream, 65536) {
+        Ok(b) => b
+        Err(e) => return Err(e)
+    }
+    if chunk.len() == 0 {
+        ro pe = PostgresError { kind: Protocol { what: "server closed the connection" } }
+        return Err(ConnError.Protocol { error: pe })
+    }
+    match @session.feed(chunk) {
+        Ok(evs) => {
+            // A QueryError event is NOT buffered: a payload-carrying enum
+            // value entering the pending vec (a record field) is the mono
+            // shape that corrupts the heap in the live example TU
+            // (repro-local/query_error_live). It is remembered here, at
+            // pump time; rows already decoded before the error stay
+            // buffered and are delivered before the Ready that ends the
+            // answer - the session emits no rows after an error anyway.
+            mut j = 0
+            while j < evs.len() {
+                match evs[j] {
+                    QueryError { sqlstate, message } =>
+                        @iter.remember(server_error(sqlstate, message))
+                    _ => @iter.pending.push(evs[j])
+                }
+                j += 1
+            }
+            Ok(())
+        }
+        Err(e) => Err(session_error(e))
+    }
+}
+
+// Kind dispatch for one buffered event, in its own method: the payload
+// is never rebound - the originally fetched value is returned as-is
+// (rebuilding a Row here made the mono collector emit a SECOND C type for
+// PgEvent, Option<Event2> vs Option[PgEvent>, mismatching at the call
+// boundary). Kept out of next()'s body: with a QueryError arm inline, the
+// big next() mis-lowers in the live example TU and corrupts the heap
+// (repro-local/query_error_live).
+fn Connection mut @dispatch_event(e PgEvent) -> Option[PgEvent] {
+    match e {
+        Row { .. } => return Some(e)
+        Ready { .. } => {
+            @iter.pending.truncate(0)
+            @iter.pos = 0
+            @iter.done = true
+            return None
+        }
+        // QueryError never reaches pending: pump_once remembers it and
+        // filters it out of the buffer.
+        _ => ()
+    }
+    None
+}
+
+/// The iterator-source half of the protocol: a Connection IS its cursor
+/// (Next[PgEvent] above), so iterating it yields itself.
+export fn Connection @iter() -> Connection => @
+
+/// The error that ended the last iteration (None on a clean end).
+export fn Connection @error() -> Option[ConnError] {
+    if @iter.err_set {
+        return Some(@iter.err)
+    }
+    None
+}
+
+/// Drain the rest of the current answer (rows are read and dropped)
+/// so the session is Ready for the next query. For a server error this
+/// drains the skip to ReadyForQuery; a dead connection surfaces its
+/// error.
+export fn Connection mut @skip_answer() Net -> Result[(), ConnError] {
+    while true {
+        match @next() {
+            Some(_) => ()
+            None => {
+                match @iter.err_set {
+                    true => match @iter.err {
+                        ConnError.Server { .. } => {
+                            // The skip completed: the session reached
+                            // ReadyForQuery. The cycle is over — the
+                            // error was already read via @error — clear
+                            // it and be done; the connection is Ready
+                            // for the next query.
+                            @iter.err_set = false
+                            @iter.done = true
+                            return Ok(())
+                        }
+                        _ => return Err(@iter.err)
+                    }
+                    false => return Ok(())
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Transaction-status byte of the last ReadyForQuery (`I`/`T`/`E`).
 export fn Connection @transaction_status() -> u8 =>
     @session.transaction_status()
@@ -215,167 +445,59 @@ export fn Connection consume @close() Net -> Result[(), ConnError] {
 /// politely at scope exit; the final flush (Terminate) still reaches the
 /// server. Explicit [`@close`] remains for callers that want to observe
 /// the write error.
-export fn Connection consume @cleanup(_outcome ScopeOutcome) Net -> () {
-    ro _r = @close()
-}
-
-/// A cursor over the rows of one query. The next row is pulled AT RUNTIME
-/// by [`RowStream @next`]: the stream drains the session to the socket and
-/// reads only as many bytes as the next row needs — nothing is collected
-/// up front, so a million-row answer costs one row of memory. A consume
-/// type: the connection moves into the stream and comes back out of
-/// [`RowStream @finish`].
-export type RowStream consume {
-    consume conn Connection
-    mut pending []PgEvent
-    mut pos int
-}
-
-/// Start a simple query and take the connection into a row stream. The
-/// connection is consumed until [`RowStream @finish`] returns it.
-export fn row_stream(consume conn Connection, q str) Net -> Result[RowStream, ConnError] {
-    match conn.session.query(q) {
-        Ok(()) => ()
-        Err(e) => {
-            ro _c = conn.close()
-            return Err(ConnError.Protocol { error: e })
-        }
-    }
-    consume rows = RowStream { conn, pending: []PgEvent.new(), pos: 0 }
-    Ok(rows)
-}
-
-/// The next row at runtime: `Ok(Some(Row { values }))` per DataRow,
-/// `Ok(None)` at the ReadyForQuery that closes the cycle. Non-row events
-/// (RowDescription, CommandComplete, EmptyQuery, Notice) are consumed
-/// inside; a QueryError surfaces as [`ConnError.Server`] with its
-/// SQLSTATE and fields. Socket bytes are read only when no decoded event
-/// is buffered.
-export fn RowStream mut @next() Net -> Result[Option[PgEvent], ConnError] {
-    while true {
-        if @pos < @pending.len() {
-            ro e = @pending[@pos]
-            @pos += 1
-            // Kind test without destructuring: reconstructing Some(Row{..})
-            // here made the mono collector emit a SECOND C type for PgEvent
-            // (Option<Event2> vs Option<PgEvent> mismatch at the call
-            // boundary). The original value is returned as-is.
-            if is_row_event(e) {
-                return Ok(Some(e))
-            }
-            match e {
-                Ready { .. } => return Ok(None)
-                QueryError { sqlstate, fields } => return Err(ConnError.Server { sqlstate, fields })
-                _ => ()
-            }
-        } else {
-            @pending.truncate(0)
-            @pos = 0
-            ro out = @conn.session.drain()
-            if out.len() > 0 {
-                write_stream(@conn.stream, out)?
-            }
-            ro chunk = read_stream(@conn.stream, 65536)?
-            if chunk.len() == 0 {
-                ro pe = PostgresError { kind: Protocol { what: "server closed the connection" } }
-                return Err(ConnError.Protocol { error: pe })
-            }
-            ro evs = match @conn.session.feed(chunk) {
-                Ok(e) => e
-                Err(e) => return Err(session_error(e))
-            }
-            @pending.append(evs)
-        }
-    }
-    Ok(None)
-}
-
-/// Close the stream normally: drain the rest of the answer (rows not
-/// pulled by the caller are read and dropped, so the server completes
-/// cleanly and the session is Ready) and give the connection back for
-/// the next query — the same thing database/sql's Rows.Close does
-/// internally. The abnormal ending is [`RowStream @abort`]. If draining
-/// fails the error decides: a server error (SQLSTATE) is an
-/// application-level failure — the server recovers on its own (skips to
-/// ReadyForQuery), so the stream keeps draining to the cycle end and the
-/// connection comes back usable; anything else (transport, protocol,
-/// auth, refused TLS) means the connection is dead — it is closed before
-/// the error returns. Either way a stream that dies with ownership never
-/// leaves the socket unterminated.
-export fn RowStream consume @close() Net -> Result[Connection, ConnError] {
-    mut done = false
-    // Typed binding on purpose: a bare `None` literal infers as
-    // Option[int] at the C-codegen stage (the none_slice_lower family).
-    mut failed Option[ConnError] = None
-    while !done {
-        match @next() {
-            Ok(Some(_)) => ()
-            Ok(None) => { done = true }
-            Err(e) => {
-                // Server errors leave the connection usable — keep
-                // draining to ReadyForQuery and report them at the end.
-                match e {
-                    ConnError.Server { .. } => { failed = Some(e) }
-                    _ => {
-                        done = true
-                        failed = Some(e)
-                    }
-                }
-            }
-        }
-    }
-    match failed {
-        Some(e) => {
-            match e {
-                ConnError.Server { .. } => Err(e)
-                _ => {
-                    ro _c = @conn.close()
-                    Err(e)
-                }
-            }
-        }
-        None => Ok(@conn)
-    }
-}
-
-/// Abort the stream early: stop reading rows and close the connection
-/// now (Terminate last, no drain). The connection is NOT returned — the
-/// PostgreSQL wire protocol cannot resume mid-answer, so an aborted
-/// stream can only end its connection.
-export fn RowStream consume @abort() Net -> Result[(), ConnError] {
-    @conn.close()
-}
-
-/// Scope-exit cleanup (D432) — the STANDARD closing mechanism for the
-/// stream. The outcome decides the shape: on a normal scope exit the
-/// stream is closed normally (the answer is drained so the server
-/// completes cleanly, then the connection is closed politely — the
-/// connection cannot escape a scope exit); on a failing or panicking
-/// exit the stream is aborted instead — no time is spent draining a
-/// doomed scope.
-export fn RowStream consume @cleanup(outcome ScopeOutcome) Net -> () {
+export fn Connection consume @cleanup(outcome ScopeOutcome) Net -> () {
     match outcome {
         Success => {
-            ro _r = @drain_and_close()
+            // Штатный выход: если ответ дочитан не до конца — дочитать
+            // (сервер завершит чисто), затем закрыть вежливо.
+            ro _d = @drain_for_cleanup()
+            ro _r = @close()
         }
         _ => {
-            ro _r = @abort()
+            ro _r = @close()
         }
     }
 }
 
-// Drain the rest of the answer (rows and a trailing error are dropped —
-// the scope is already ending), then close the connection politely.
-fn RowStream consume @drain_and_close() Net -> Result[(), ConnError] {
-    mut done = false
-    while !done {
-        match @next() {
-            Ok(Some(_)) => ()
-            Ok(None) => { done = true }
-            Err(_) => { done = true }
+// Drain a half-finished answer at scope exit; errors are dropped — the
+// scope is already ending.
+fn Connection consume @drain_for_cleanup() Net -> () {
+    mut guard = 0
+    while @next() != None && guard < 100000000 {
+        guard += 1
+    }
+}
+
+/// The row's `i`-th value as text — the ergonomic accessor for the
+/// common "read a column" case; NULL and non-UTF-8 values are
+/// structured errors, never silent defaults.
+export fn text_at(row PgEvent, i int) -> Result[str, ConnError] {
+    match row {
+        Row { values } => {
+            if i < 0 || i >= values.len() {
+                ro pe = PostgresError { kind: Malformed { what: "column index out of range" } }
+                return Err(ConnError.Protocol { error: pe })
+            }
+            ro v = values[i]
+            match v.data {
+                Some(b) => match b.to_str() {
+                    Ok(t) => Ok(t)
+                    Err(_) => {
+                        ro pe = PostgresError { kind: Utf8 { what: "row value" } }
+                        Err(ConnError.Protocol { error: pe })
+                    }
+                }
+                None => {
+                    ro pe = PostgresError { kind: Malformed { what: "row value is NULL" } }
+                    Err(ConnError.Protocol { error: pe })
+                }
+            }
+        }
+        _ => {
+            ro pe = PostgresError { kind: Protocol { what: "expected a DataRow event" } }
+            Err(ConnError.Protocol { error: pe })
         }
     }
-    @conn.close()
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -435,9 +557,9 @@ fn startup_check_plain(consume conn Connection, evs []PgEvent) Net -> Result[Con
     mut i = 0
     while i < evs.len() {
         match evs[i] {
-            QueryError { sqlstate, fields } => {
+            QueryError { sqlstate, message } => {
                 ro _c = conn.close()
-                return Err(ConnError.Server { sqlstate, fields })
+                return Err(server_error(sqlstate, message))
             }
             _ => ()
         }
@@ -483,14 +605,6 @@ fn pump_plain(mut conn Connection) Net -> Result[[]PgEvent, ConnError] {
     Ok(events)
 }
 
-// Kind test for the row stream (no payload destructuring — see the note
-// in RowStream @next).
-fn is_row_event(e PgEvent) -> bool {
-    match e {
-        Row { .. } => true
-        _ => false
-    }
-}
 
 // A session/decoder failure classified for the adapter: an Auth kind means
 // the server rejected authentication; anything else is a protocol failure.

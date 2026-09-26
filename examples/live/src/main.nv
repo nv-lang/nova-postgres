@@ -50,8 +50,8 @@ import std.os.{real_os, args}
 import std.fs.{real_fs, read, Path}
 import std.encoding.base64.{Base64}
 import tls.{TlsStream, ClientConfig, VerificationMode, TlsError, TlsVersion, Tls12, Tls13}
-import postgres.{Session, SessionPhase, PgEvent, ParamValue, Row, QueryError, Ready, ClientMessage, ErrorField, SslAnswer, TlsSupported, TlsRefused}
-import postgres.pgnet.{ConnError, open_tcp, connect_plain, row_stream, Connection}
+import postgres.{Session, SessionPhase, PgEvent, ParamValue, Row, QueryError, Ready, ClientMessage, SslAnswer, TlsSupported, TlsRefused, PostgresError, Protocol, Malformed}
+import postgres.pgnet.{ConnError, connect, open_tcp, connect_plain, text_at, Connection}
 
 /// Whether and how to ask for TLS — slice Д8в criterion 2's TlsMode. It
 /// lives in the entry module (see the banner): pgnet imports no tls types.
@@ -92,6 +92,9 @@ fn run(host str, port int, mode str, argv []str) Fs Net Random -> Result[str, st
         // (c) the system roots do not know our CA — structured TLS error.
         ro name = argv.get(5) ?? host
         return expect_tls_ca_error(host, port, VerificationMode.SystemRoots, name)
+    }
+    if mode == "multi" {
+        return multi_query_iteration(host, port).map_err(fn(e ConnError) -> str { "${e}" })
     }
     if mode == "rowerr" {
         return row_stream_error_recovery(host, port)
@@ -191,19 +194,6 @@ fn tls_handshake(consume stream TcpStream, server_name str, verify VerificationM
     Ok(ts)
 }
 
-fn message_of(fields []ErrorField) -> str {
-    // Indexed walk, not `for f in fields`: VecIter over a record slice
-    // mis-copies payloads in some compilation units (the opt_slice_iter
-    // defect family) — observed as a C-build failure on this very line.
-    mut i = 0
-    while i < fields.len() {
-        if fields[i].code == 'M' as u8 {
-            return fields[i].value
-        }
-        i += 1
-    }
-    ""
-}
 
 // (a)+(5): everything over TLS with the custom CA.
 fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mode TlsMode) Net Random -> Result[str, str] {
@@ -249,7 +239,7 @@ fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mo
     mut si = 0
     while si < evs0.len() {
         match evs0[si] {
-            QueryError { sqlstate, fields } => return Err("server error ${sqlstate}: ${message_of(fields)}")
+            QueryError { sqlstate, message } => return Err("server error ${sqlstate}: ${message}")
             _ => ()
         }
         si += 1
@@ -413,46 +403,100 @@ fn expect_tls_ca_error(host str, port int, verify VerificationMode, server_name 
     }
 }
 
+// Two queries in a row with row iteration in between: the first query's
+// stream is closed (drained, connection returned), then the connection
+// runs the second query and its own stream.
+fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError] {
+    consume conn = connect(host, port, "postgres", "smoke", "postgres")?
+    // Query 1: the connection itself is the row cursor.
+    conn.query("SELECT generate_series(1, 5)")?
+    mut count = 0
+    mut sum = 0
+    for row in conn {
+        sum += to_int(text_at(row, 0)?)?
+        count += 1
+    }
+    match conn.error() {
+        Some(e) => return Err(e)
+        None => ()
+    }
+    if count != 5 || sum != 15 {
+        return Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "query 1: ${count} rows, sum ${sum} (want 5 and 15)" } } })
+    }
+    println("live: query 1: ${count} rows iterated, sum ${sum}")
+    // The same connection runs query 2 — nothing to give back.
+    conn.query("SELECT 42")?
+    mut answer = 0
+    for row in conn {
+        answer = to_int(text_at(row, 0)?)?
+    }
+    match conn.error() {
+        Some(e) => return Err(e)
+        None => ()
+    }
+    if answer != 42 {
+        return Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "query 2: ${answer} (want 42)" } } })
+    }
+    println("live: query 2 on the same connection -> '${answer}'")
+    conn.close()?
+    Ok("multi: 5 rows iterated (sum 15), then SELECT 42 = ${answer} on the same connection")
+}
+
 // A server error (SQLSTATE) through the row stream leaves the connection
 // usable: next() reports 42601 structurally, @close drains to the cycle
 // end and returns the connection, and the next query works.
+
+
 fn row_stream_error_recovery(host str, port int) Net Random -> Result[str, str] {
-    consume conn = match connect_plain(match open_tcp(host, port) {
-        Ok(consume s) => s
-        Err(e) => return Err("tcp: ${e}")
-    }, "postgres", "smoke", "postgres") {
+    consume conn = match connect(host, port, "postgres", "smoke", "postgres") {
         Ok(consume c) => c
         Err(e) => return Err("connect: ${e}")
     }
-    consume rows = match row_stream(conn, "SELEC bogus") {
-        Ok(consume r) => r
-        Err(e) => return Err("row_stream: ${e}")
+    match conn.query("SELEC bogus") {
+        Ok(()) => ()
+        Err(e) => return Err("query: ${e}")
     }
-    ro sqlstate = match rows.next() {
-        Err(ConnError.Server { sqlstate, .. }) => sqlstate
-        Err(e) => return Err("wrong error variant: ${e}")
-        Ok(_) => return Err("a syntax error produced a row")
+    ro _ = conn.next()
+    ro sqlstate = match conn.error() {
+        Some(ConnError.Server { sqlstate, .. }) => sqlstate
+        Some(e) => return Err("wrong error variant: ${e}")
+        None => return Err("a syntax error produced no error")
     }
-    if sqlstate != "42601" {
-        return Err("expected SQLSTATE 42601, got '${sqlstate}'")
+    println("live: row iteration surfaced SQLSTATE ${sqlstate}")
+    // The connection is usable after a server error: skip the rest of the
+    // answer and run the next query on the same connection.
+    match conn.skip_answer() {
+        Ok(()) => ()
+        Err(e) => return Err("skip: ${e}")
     }
-    println("live: row stream surfaced SQLSTATE ${sqlstate}")
-    // The connection comes back usable after a server error.
-    consume conn2 = match rows.close() {
-        Ok(consume c) => c
-        Err(e) => return Err("close: ${e}")
+    match conn.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => return Err("select 1: ${e}")
     }
-    ro one = plain_text_value2(conn2, "SELECT 1")?
-    if one != "1" {
-        return Err("connection after the server error answered '${one}'")
+    ro one = match conn.next() {
+        Some(row) => match text_at(row, 0) {
+            Ok(s) => s
+            Err(e) => return Err("${e}")
+        }
+        None => return Err("SELECT 1 produced no row")
     }
     println("live: same connection after the server error -> '${one}'")
-    match conn2.close() {
+    match conn.close() {
         Ok(()) => ()
         Err(e) => return Err("close: ${e}")
     }
-    Ok("RowStream: server error 42601 surfaced structurally, connection recovered")
+    Ok("row iteration: server error 42601 surfaced structurally, connection recovered")
 }
+
+// The first row's first value as text, via the for-in API; the stream
+// is closed (drained) and the connection returned by the caller.
+fn to_int(s str) -> Result[int, ConnError] {
+    match s.to_int() {
+        Ok(n) => Ok(n)
+        Err(_) => Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "not an integer: '${s}'" } } })
+    }
+}
+
 
 fn plain_text_value2(mut conn Connection, sql str) Net -> Result[str, str] {
     ro evs = match conn.simple_query(sql) {
@@ -467,6 +511,10 @@ fn plain_text_value2(mut conn Connection, sql str) Net -> Result[str, str] {
 // (d, Prefer): 'N' -> plaintext fallback through pgnet, pg_stat_ssl -> f.
 
 // (d, Disable): no SSLRequest on the wire at all, plaintext via pgnet.
+
+// Two queries in a row with row iteration in between: the first query's
+// stream is closed (drained, connection returned), then the connection
+// runs the second query and its own stream.
 
 // A server error (SQLSTATE) through the row stream leaves the connection
 // usable: next() reports 42601 structurally, @close drains to the cycle
@@ -569,35 +617,35 @@ fn single_text_value(mut stream TlsStream, mut session Session, sql str, what st
 
 // The ssl value pulled through the row-stream API: one row, one next().
 fn plain_ssl_value(consume conn Connection) Net -> Result[str, str] {
-    consume rows = match row_stream(conn, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()") {
-        Ok(consume r) => r
+    match conn.query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()") {
+        Ok(()) => ()
         Err(e) => return Err("${e}")
     }
-    ro val = match rows.next() {
-        Ok(Some(Row { values })) => {
-            if values.len() < 1 {
-                return Err("ssl row has no columns")
-            }
-            ro v = values[0]
-            match v.data {
-                Some(b) => {
-                    match b.to_str() {
-                        Ok(t) => t
-                        Err(_) => return Err("ssl value is not UTF-8")
-                    }
+    mut val = ""
+    mut got = false
+    for row in conn {
+        if !got {
+            match text_at(row, 0) {
+                Ok(t) => {
+                    val = t
+                    got = true
                 }
-                None => return Err("ssl value is NULL")
+                Err(e) => return Err("${e}")
             }
         }
-        Ok(Some(_)) => return Err("ssl row is not a DataRow")
-        Ok(None) => return Err("no row in the answer")
+    }
+    if !got {
+        return Err("no row in the answer")
+    }
+    match conn.error() {
+        Some(e) => return Err("${e}")
+        None => ()
+    }
+    match conn.skip_answer() {
+        Ok(()) => ()
         Err(e) => return Err("${e}")
     }
-    consume conn2 = match rows.close() {
-        Ok(consume c) => c
-        Err(e) => return Err("${e}")
-    }
-    match conn2.close() {
+    match conn.close() {
         Ok(()) => ()
         Err(e) => return Err("close: ${e}")
     }

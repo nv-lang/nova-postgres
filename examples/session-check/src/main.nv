@@ -195,7 +195,7 @@ fn ev(e PgEvent) -> str =>
         Complete { tag } => "cc:${tag}"
         EmptyQuery => "empty"
         Notice { fields } => "notice:${error_message(fields)}"
-        QueryError { sqlstate, fields } => "error:${sqlstate}:${error_message(fields)}"
+        QueryError { sqlstate, message } => "error:${sqlstate}:${message}"
     }
 
 fn row_render(values []ParamValue) -> str {

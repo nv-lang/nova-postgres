@@ -49,7 +49,13 @@ the consumer through `nova-tls` (see `examples/live`).
   is a structured protocol error) / `connect_plain` (start-up +
   authentication) build a Ready `Connection`; `simple_query` /
   `extended_query` run one query round; `transaction_status` reads `I`/`T`/`E`;
-  `close` sends the final flush. Failures are structured `ConnError`
+  `close` sends the final flush. Rows stream through the connection itself:
+  `conn.query(q)` sends one query, then `for row in conn` / `conn.next()`
+  pull the next row at runtime (reading the socket only as far as needed);
+  after the loop, `conn.error()` holds the error that ended the iteration
+  (read it if the loop stopped early) and `conn.skip_answer()` drains to
+  ReadyForQuery — so a SQL error (42601 etc.) keeps the connection usable.
+  `text_at(row, i)` decodes one text column. Failures are structured `ConnError`
   variants (`Net`, `RefusedTls`, `Protocol`, `Auth`, `Server` with SQLSTATE
   and fields) — matchable, not strings. The SCRAM nonce is drawn from OS
   randomness here, at the edge. TLS itself is composed by the consumer
@@ -66,7 +72,10 @@ the consumer through `nova-tls` (see `examples/live`).
   (SCRAM over TLS 1.3, `pg_stat_ssl`, the whole D8b flow, transaction
   statuses T/E/I), structured TLS errors (hostname mismatch, unknown CA),
   and the plaintext modes (Require → structured RefusedTls, Prefer/Disable →
-  plaintext). Declares the `tls` dependency on nova-tls.
+  plaintext). Declares the `tls` dependency on nova-tls. The `multi` mode
+  runs two queries on one connection with a for-in row iteration; `rowerr`
+  surfaces a 42601 through the iterator, then `skip_answer()` and the next
+  query on the same connection.
 - `src/*_test.nv` — peer tests: every encoder against reference bytes from
   the protocol documentation, every decoder against reference frames, every
   proper prefix answering "need more bytes", streams cut at every byte, the
@@ -87,6 +96,26 @@ consume conn = match connect("127.0.0.1", 5432, "postgres", "pw", "postgres") {
 ro evs = conn.simple_query("SELECT 1")?   // []PgEvent up to ReadyForQuery
 ro status = conn.transaction_status()     // u8: 'I' | 'T' | 'E'
 ro fin = conn.close()                     // final flush with Terminate
+```
+
+Streaming rows, one query at a time on the same connection:
+
+```nova
+consume conn = match connect("127.0.0.1", 5432, "postgres", "pw", "postgres") {
+    Ok(consume c) => c
+    Err(e) => return
+}
+conn.query("SELECT generate_series(1, 5)")?
+mut sum = 0
+for row in conn {
+    sum += (text_at(row, 0) ?? "0").to_int() ?? 0
+}
+match conn.error() {                       // SQL errors land here,
+    Some(e) => { ro _ = conn.skip_answer() // then skip_answer() restores
+                 println("server error: ${e.to_str()}") } // the connection
+    None => ()
+}
+ro answer = conn.simple_query("SELECT 42")? // same connection, still usable
 ```
 
 Pure core without the adapter:

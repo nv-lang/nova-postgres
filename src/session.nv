@@ -64,8 +64,13 @@ export type PgEvent enum
     | Notice { fields []ErrorField }
     /// An ErrorResponse mid-query. The session skips to the ReadyForQuery
     /// that closes the cycle and recovers; the event carries the SQLSTATE
-    /// (field `C`) and the raw fields.
-    | QueryError { sqlstate str, fields []ErrorField }
+    /// (field `C`) and the human message (field `M`), rendered at decode.
+    /// NOT the raw []ErrorField vec: a vec inside this enum's payload is
+    /// the mono shape that corrupts the heap when the event and the
+    /// adapter's iterator state share a compilation unit (measured in
+    /// repro-local/query_error_live: 15/15 segfaults; the str payload
+    /// survives 20/20).
+    | QueryError { sqlstate str, message str }
 
 /// The connection state machine. Pure: feed bytes in, drain bytes out, read
 /// events off each [`Session @feed`] call. Fields are private to the
@@ -271,14 +276,14 @@ fn Session mut @dispatch(msg ServerMessage, mut events []PgEvent) -> Result[(), 
         ErrorResponse { fields } => match @phase {
             Authenticating => Err(PostgresError { kind: Auth { what: "server rejected authentication (SQLSTATE ${sqlstate(fields)}): ${error_message(fields)}" } })
             Startup => {
-                events.push(PgEvent.QueryError { sqlstate: sqlstate(fields), fields })
+                events.push(PgEvent.QueryError { sqlstate: sqlstate(fields), message: error_message(fields) })
                 @phase = Failed
                 Ok(())
             }
             QuerySimple | QueryExtended => {
                 if !@in_error {
                     @in_error = true
-                    events.push(PgEvent.QueryError { sqlstate: sqlstate(fields), fields })
+                    events.push(PgEvent.QueryError { sqlstate: sqlstate(fields), message: error_message(fields) })
                 }
                 Ok(())
             }
