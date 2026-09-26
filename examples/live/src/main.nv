@@ -405,7 +405,7 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
     mut count = 0
     mut sum = 0
     for row in conn {
-        sum += row.text_at(0).flat_map(|s| to_int(s))?
+        sum += row.int_at(0)?
         count += 1
     }
     match conn.error() {
@@ -417,10 +417,16 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
     }
     println("live: query 1: ${count} rows iterated, sum ${sum}")
     // The same connection runs query 2 — nothing to give back.
-    conn.query("SELECT 42")?
+    conn.query("SELECT 42, 7::int8, 2.5::float8, true")?
     mut answer = 0
+    mut big = 0 as i64
+    mut frac = 0.0
+    mut flag = false
     for row in conn {
-        answer = row.text_at(0).flat_map(|s| to_int(s))?
+        answer = row.int_at(0)?
+        big = row.i64_at(1)?
+        frac = row.f64_at(2)?
+        flag = row.bool_at(3)?
     }
     match conn.error() {
         Some(e) => return Err(e)
@@ -429,9 +435,12 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
     if answer != 42 {
         return Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "query 2: ${answer} (want 42)" } } })
     }
-    println("live: query 2 on the same connection -> '${answer}'")
+    if big != 7 as i64 || frac != 2.5 || !flag {
+        return Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "typed accessors: ${big}, ${frac}, ${flag} (want 7, 2.5, true)" } } })
+    }
+    println("live: query 2 on the same connection -> '${answer}', i64 ${big}, f64 ${frac}, bool ${flag}")
     conn.close()?
-    Ok("multi: 5 rows iterated (sum 15), then SELECT 42 = ${answer} on the same connection")
+    Ok("multi: 5 rows iterated (sum 15), then typed columns 42/7/2.5/true on the same connection")
 }
 
 // A server error (SQLSTATE) through the row cursor leaves the connection
@@ -486,12 +495,6 @@ fn row_stream_error_recovery(host str, port int) Net Random -> Result[str, str] 
 
 // The first row's first value as text, via the for-in API; the stream
 // is closed (drained) and the connection returned by the caller.
-fn to_int(s str) -> Result[int, ConnError] {
-    match s.to_int() {
-        Ok(n) => Ok(n)
-        Err(_) => Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "not an integer: '${s}'" } } })
-    }
-}
 
 
 fn plain_text_value2(mut conn Connection, sql str) Net -> Result[str, str] {

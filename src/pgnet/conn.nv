@@ -539,6 +539,54 @@ export fn PgEvent @text_at(i int) -> Result[str, ConnError] {
 /// call sites that hold the event indirectly.
 export fn text_at(row PgEvent, i int) -> Result[str, ConnError] =>
     row.text_at(i)
+// Structured Malformed error with the offending value in the message.
+fn malformed(what str) -> ConnError =>
+    ConnError.Protocol { error: PostgresError { kind: Malformed { what } } }
+
+/// Column i decoded as an integer (Postgres int/serial family, any size
+/// Nova's int parses). The chainable form: `row.int_at(0)?`.
+export fn PgEvent @int_at(i int) -> Result[int, ConnError] =>
+    @text_at(i).flat_map(|s| match s.to_int() {
+        Ok(n) => Ok(n)
+        Err(_) => Err(malformed("not an integer: '${s}'"))
+    })
+
+/// Column i decoded as i64 (Postgres bigint/bigserial).
+export fn PgEvent @i64_at(i int) -> Result[i64, ConnError] =>
+    @text_at(i).flat_map(|s| match s.to_i64() {
+        Ok(n) => Ok(n)
+        Err(_) => Err(malformed("not an i64: '${s}'"))
+    })
+
+/// Column i decoded as i32 (Postgres integer/serial).
+export fn PgEvent @i32_at(i int) -> Result[i32, ConnError] =>
+    @text_at(i).flat_map(|s| match s.to_i32() {
+        Ok(n) => Ok(n)
+        Err(_) => Err(malformed("not an i32: '${s}'"))
+    })
+
+/// Column i decoded as f64 (Postgres float/real/numeric text form).
+export fn PgEvent @f64_at(i int) -> Result[f64, ConnError] =>
+    @text_at(i).flat_map(|s| match s.to_f64() {
+        Ok(n) => Ok(n)
+        Err(_) => Err(malformed("not an f64: '${s}'"))
+    })
+
+/// Column i decoded as bool. Postgres sends 't'/'f' in the text
+/// protocol; the strict std "true"/"false" spellings are accepted too.
+export fn PgEvent @bool_at(i int) -> Result[bool, ConnError] =>
+    @text_at(i).flat_map(|s| {
+        if s == "t" {
+            return Ok(true)
+        }
+        if s == "f" {
+            return Ok(false)
+        }
+        match s.to_bool() {
+            Ok(b) => Ok(b)
+            Err(_) => Err(malformed("not a boolean: '${s}'"))
+        }
+    })
 
 
 // ──────────────────────────────────────────────────────────────────────────
