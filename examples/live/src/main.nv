@@ -405,7 +405,7 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
     mut count = 0
     mut sum = 0
     for row in conn {
-        sum += to_int(row.text_at(0)?)?
+        sum += row.text_at(0).flat_map(|s| to_int(s))?
         count += 1
     }
     match conn.error() {
@@ -420,7 +420,7 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
     conn.query("SELECT 42")?
     mut answer = 0
     for row in conn {
-        answer = to_int(row.text_at(0)?)?
+        answer = row.text_at(0).flat_map(|s| to_int(s))?
     }
     match conn.error() {
         Some(e) => return Err(e)
