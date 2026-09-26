@@ -287,11 +287,12 @@ export fn RowStream mut @next() Net -> Result[Option[PgEvent], ConnError] {
     Ok(None)
 }
 
-/// Give the connection back. Drains the rest of the answer first (rows
-/// not pulled by the caller are read and dropped), so the session is
-/// Ready for the next query. This is the reuse path — the same thing
-/// database/sql's Rows.Close does internally.
-export fn RowStream consume @finish() Net -> Result[Connection, ConnError] {
+/// Close the stream normally: drain the rest of the answer (rows not
+/// pulled by the caller are read and dropped, so the server completes
+/// cleanly and the session is Ready) and give the connection back for
+/// the next query — the same thing database/sql's Rows.Close does
+/// internally. The abnormal ending is [`RowStream @abort`].
+export fn RowStream consume @close() Net -> Result[Connection, ConnError] {
     mut done = false
     while !done {
         match @next() {
@@ -301,6 +302,46 @@ export fn RowStream consume @finish() Net -> Result[Connection, ConnError] {
         }
     }
     Ok(@conn)
+}
+
+/// Abort the stream early: stop reading rows and close the connection
+/// now (Terminate last, no drain). The connection is NOT returned — the
+/// PostgreSQL wire protocol cannot resume mid-answer, so an aborted
+/// stream can only end its connection.
+export fn RowStream consume @abort() Net -> Result[(), ConnError] {
+    @conn.close()
+}
+
+/// Scope-exit cleanup (D432) — the STANDARD closing mechanism for the
+/// stream. The outcome decides the shape: on a normal scope exit the
+/// stream is closed normally (the answer is drained so the server
+/// completes cleanly, then the connection is closed politely — the
+/// connection cannot escape a scope exit); on a failing or panicking
+/// exit the stream is aborted instead — no time is spent draining a
+/// doomed scope.
+export fn RowStream consume @cleanup(outcome ScopeOutcome) Net -> () {
+    match outcome {
+        Success => {
+            ro _r = @drain_and_close()
+        }
+        _ => {
+            ro _r = @abort()
+        }
+    }
+}
+
+// Drain the rest of the answer (rows and a trailing error are dropped —
+// the scope is already ending), then close the connection politely.
+fn RowStream consume @drain_and_close() Net -> Result[(), ConnError] {
+    mut done = false
+    while !done {
+        match @next() {
+            Ok(Some(_)) => ()
+            Ok(None) => { done = true }
+            Err(_) => { done = true }
+        }
+    }
+    @conn.close()
 }
 
 // ──────────────────────────────────────────────────────────────────────────

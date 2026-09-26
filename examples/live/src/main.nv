@@ -536,7 +536,7 @@ fn plain_ssl_value(consume conn Connection) Net -> Result[str, str] {
         Ok(None) => return Err("no row in the answer")
         Err(e) => return Err("${e}")
     }
-    consume conn2 = match rows.finish() {
+    consume conn2 = match rows.close() {
         Ok(consume c) => c
         Err(e) => return Err("${e}")
     }
