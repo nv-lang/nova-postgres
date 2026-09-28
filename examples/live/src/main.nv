@@ -51,7 +51,7 @@ import std.fs.{real_fs, read, write_text, Path}
 import std.encoding.base64.{Base64}
 import tls.{TlsStream, ClientConfig, VerificationMode, TlsError, TlsVersion, Tls12, Tls13}
 import postgres.{Session, SessionPhase, PgEvent, ParamValue, Row, QueryError, Ready, ClientMessage, SslAnswer, TlsSupported, TlsRefused, PostgresError, Protocol, Malformed}
-import postgres.pgnet.{ConnError, connect, open_tcp, connect_plain, text_at, Connection, Listener, ListenerMsg, ListenerEvent, Note, Event, Connected, Reconnected, Reconnecting}
+import postgres.pgnet.{ConnError, connect, connect_options, open_tcp, connect_plain, text_at, Connection, Pool, Listener, ListenerMsg, ListenerEvent, Note, Event, Connected, Reconnected, Reconnecting}
 
 /// Whether and how to ask for TLS — slice Д8в criterion 2's TlsMode. It
 /// lives in the entry module (see the banner): pgnet imports no tls types.
@@ -114,6 +114,9 @@ fn run(host str, port int, mode str, argv []str) Fs Net Random Time -> Result[st
     }
     if mode == "listener" {
         return listener_mode(host, port)
+    }
+    if mode == "pool" {
+        return pool_mode(host, port)
     }
     Err("unknown mode '${mode}'")
 }
@@ -709,6 +712,59 @@ fn notify_mode(host str, port int) Net Random -> Result[str, str] {
         Err(e) => return Err("conn1 close: ${e}")
     }
     Ok("LISTEN/NOTIFY: blocking next_event delivered {pid, channel, payload}; a mid-query notification was buffered and polled with try_next_event")
+}
+
+
+// Pool (plan 286.2): limit 2 — two live connections, PoolExhausted on the
+// third try_acquire, warm reuse after release (same pg_backend_pid).
+fn pool_mode(host str, port int) Net Random Time -> Result[str, str] {
+    consume pool = Pool.new(connect_options(host, port, "postgres", "smoke", "postgres"), 2)
+    consume a = match pool.acquire() {
+        Ok(consume c) => c
+        Err(e) => return Err("acquire a: ${e}")
+    }
+    ro pid_a = first_text_value(match a.simple_query("SELECT pg_backend_pid()") {
+        Ok(evs) => evs
+        Err(e) => return Err("pid a: ${e}")
+    }, "pid a")?
+    consume b = match pool.try_acquire() {
+        Ok(consume c) => c
+        Err(e) => return Err("try_acquire b: ${e}")
+    }
+    ro pid_b = first_text_value(match b.simple_query("SELECT pg_backend_pid()") {
+        Ok(evs) => evs
+        Err(e) => return Err("pid b: ${e}")
+    }, "pid b")?
+    if pid_a == pid_b {
+        return Err("two live connections share backend pid ${pid_a}")
+    }
+    match pool.try_acquire() {
+        Ok(consume extra) => {
+            ro _r = extra.close()
+            return Err("try_acquire past the limit succeeded")
+        }
+        Err(e) => match e {
+            ConnError.PoolExhausted => println("live: try_acquire at the limit -> PoolExhausted")
+            _ => return Err("try_acquire at the limit: ${e} (want PoolExhausted)")
+        }
+    }
+    pool.release(a)
+    consume a2 = match pool.acquire() {
+        Ok(consume c) => c
+        Err(e) => return Err("re-acquire a: ${e}")
+    }
+    ro pid_a2 = first_text_value(match a2.simple_query("SELECT pg_backend_pid()") {
+        Ok(evs) => evs
+        Err(e) => return Err("pid a2: ${e}")
+    }, "pid a2")?
+    if pid_a2 != pid_a {
+        return Err("warm reuse: pid ${pid_a2}, want the released ${pid_a}")
+    }
+    println("live: released connection re-acquired warm (pid ${pid_a2})")
+    pool.release(a2)
+    pool.release(b)
+    pool.close()
+    Ok("pool: limit honoured, PoolExhausted at the limit, warm reuse by pg_backend_pid")
 }
 
 
