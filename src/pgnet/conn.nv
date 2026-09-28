@@ -179,7 +179,7 @@ export fn connect_plain(consume stream TcpStream, user str, password str, databa
     consume conn = Connection {
         stream,
         session: Session.new(user, password, database, Base64.encode(Random.bytes(18))),
-        iter: ConnIter { pending: []PgEvent.new(), pos: 0, err: ConnError.TlsUnavailable, err_set: false, done: true },
+        iter: ConnIter { pending: []PgEvent.new(), pos: 0, notifyq: []Notification.new(), err: ConnError.TlsUnavailable, err_set: false, done: true },
     }
     start_plain(conn)
 }
@@ -194,6 +194,11 @@ export fn connect_plain(consume stream TcpStream, user str, password str, databa
 export type ConnIter consume {
     mut pending []PgEvent
     mut pos int
+    /// Buffered LISTEN/NOTIFY notifications: pump_once routes
+    /// PgEvent.Notify here (never into `pending`), both while idle
+    /// and mid-query, so an asynchronous notification is never lost and
+    /// never surfaces as a row.
+    mut notifyq []Notification
     /// The error that ended the last iteration. NOT Option[ConnError]:
     /// an enum-with-payload inside Option, stored in a record field,
     /// mis-lowers in the large live example TU and corrupts the heap
@@ -218,6 +223,14 @@ export type Connection consume {
     consume stream TcpStream
     consume session Session
     consume iter ConnIter
+}
+
+/// One asynchronous LISTEN/NOTIFY message (plan 286.1): the notifying
+/// backend's process id, the channel, and the payload.
+export type Notification value {
+    ro pid int
+    ro channel str
+    ro payload str
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -395,6 +408,11 @@ fn Connection mut @pump_once() Net -> Result[(), ConnError] {
                 match evs[j] {
                     QueryError { sqlstate, message } =>
                         @iter.remember(server_error(sqlstate, message))
+                    // Asynchronous LISTEN/NOTIFY: buffered in the notify
+                    // queue (try_next_event / next_event), never a row,
+                    // never lost mid-query.
+                    Notify { pid, channel, payload } =>
+                        @iter.notifyq.push(Notification { pid, channel, payload })
                     _ => @iter.pending.push(evs[j])
                 }
                 j += 1
@@ -438,6 +456,42 @@ export fn Connection @error() -> Option[ConnError] {
         return Some(@iter.err)
     }
     None
+}
+
+/// Non-blocking poll of the buffered notifications (LISTEN/NOTIFY):
+/// `Some(Notification)` if one has already arrived (including ones that
+/// came in mid-query), `None` otherwise. Never touches the socket.
+export fn Connection mut @try_next_event() -> Option[Notification] {
+    if @iter.notifyq.len() == 0 {
+        return None
+    }
+    ro n = @iter.notifyq[0]
+    @iter.notifyq.remove(0, 1)
+    Some(n)
+}
+
+/// Blocking wait for the next notification: reads the socket until the
+/// server pushes one. Legal only while the connection is idle (no answer
+/// in flight — between `for row in conn` cycles); calling it mid-answer
+/// is a structural Protocol error. Cancellation is the fiber's, like
+/// pgx's ctx-cancel: kill the waiting fiber.
+export fn Connection mut @next_event() Net -> Result[Notification, ConnError] {
+    if !@iter.done {
+        ro pe = PostgresError { kind: Protocol { what: "next_event while an answer is in flight (finish or skip it first)" } }
+        return Err(ConnError.Protocol { error: pe })
+    }
+    while true {
+        match @try_next_event() {
+            Some(n) => return Ok(n)
+            None => {
+                match @pump_once() {
+                    Ok(()) => ()
+                    Err(e) => return Err(e)
+                }
+            }
+        }
+    }
+    Err(ConnError.TlsUnavailable)  // unreachable; keeps the match tail typed
 }
 
 /// Drain the rest of the current answer (rows are read and dropped)

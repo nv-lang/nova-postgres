@@ -173,7 +173,7 @@ fn ev(e PgEvent) -> str =>
         EmptyQuery => "empty"
         Notice { fields } => "notice:${error_message(fields)}"
         QueryError { sqlstate, message } => "error:${sqlstate}:${message}"
-        Notification { pid, channel, payload } => "notify:${pid}:${channel}:${payload}"
+        Notify { pid, channel, payload } => "notify:${pid}:${channel}:${payload}"
     }
 
 fn row_render(values []ParamValue) -> str {

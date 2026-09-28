@@ -24,14 +24,16 @@ MD5) идёт чистыми шагами состояния. Ядро прот�
     каждого серверного сообщения срезов (`Authentication*` всех видов,
     `ParameterStatus`, `BackendKeyData`, `ReadyForQuery`, `RowDescription`,
     `DataRow`, `CommandComplete`, `ErrorResponse`, `NoticeResponse`,
-    `ParseComplete`, `BindComplete`, `NoData`, `EmptyQueryResponse`):
+    `ParseComplete`, `BindComplete`, `NoData`, `EmptyQueryResponse`,
+    `NotificationResponse` — асинхронное сообщение LISTEN/NOTIFY):
     короткий буфер отвечает «нужно ещё байтов», плохой кадр — структурная
     ошибка `PostgresError`, паники нет.
   - `Session` — соединение как чистый автомат (consume-тип): серверные байты
     на вход, клиентские на выход, события `PgEvent` (`Authenticated`,
     `Parameter`, `BackendKey`, `Ready` со статусом транзакции, `RowDesc`,
     `Row` с сырыми значениями `[]ParamValue`, `Complete`, `EmptyQuery`,
-    `Notice`, `QueryError` с SQLSTATE). Фазы: `Authenticating → Startup →
+    `Notice`, `QueryError` с SQLSTATE, `Notify` — уведомление
+    LISTEN/NOTIFY, легальное в любой фазе, даже посреди ответа). Фазы: `Authenticating → Startup →
     Ready ⇄ QuerySimple/QueryExtended`, плюс `Closed` и `Failed`.
     Аутентификация trust, cleartext, MD5 и SCRAM-SHA-256; после ошибки
     посреди запроса автомат пропускает всё до `ReadyForQuery`, закрывающего
@@ -59,7 +61,11 @@ MD5) идёт чистыми шагами состояния. Ядро прот�
   форма для досрочного выхода. `row.text_at(i)` декодирует текстовую
   колонку; `row.int_at` / `i16_at` / `i32_at` / `i64_at` / `f64_at` /
   `bool_at` — типизированные колонки (`bool_at` понимает формат 't'/'f';
-  целые Postgres знаковые, без u*-вариантов). Отказы — структурные
+  целые Postgres знаковые, без u*-вариантов). LISTEN/NOTIFY: уведомление
+  складывается в очередь в момент прихода — в простое или посреди ответа —
+  и читается `conn.next_event()` (блокирующе; только между ответами) или
+  `conn.try_next_event()` (неблокирующий опрос) как
+  `Notification { pid, channel, payload }`. Отказы — структурные
   варианты `ConnError` (`Net`, `RefusedTls`,
   `Protocol`, `Auth`, `Server` с SQLSTATE и полями) — они матчатся, а не
   разбираются по тексту. Клиентский nonce SCRAM берётся из системного
@@ -80,7 +86,9 @@ MD5) идёт чистыми шагами состояния. Ядро прот�
   открытый текст). Объявляет зависимость `tls` от nova-tls. Режим `multi`
   — два запроса подряд по одному соединению с обходом строк в for-in;
   режим `rowerr` — ошибка 42601 внутри итерации (for-in до конца, затем
-  `conn.error()`) и следующий запрос по тому же соединению.
+  `conn.error()`) и следующий запрос по тому же соединению; режим `notify` —
+  LISTEN/NOTIFY вживую: блокирующий `next_event()` и уведомление, пришедшее
+  посреди запроса и дочитанное `try_next_event()`.
 - `src/*_test.nv` — peer-тесты: каждый кодировщик против эталонных байт из
   документации протокола, каждый декодер против эталонных кадров, каждый
   собственный префикс с ответом «нужно ещё байтов», потоки, разрезанные в

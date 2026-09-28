@@ -25,14 +25,16 @@ the consumer through `nova-tls` (see `examples/live`).
     of every server message of the slices (`Authentication*` of all kinds,
     `ParameterStatus`, `BackendKeyData`, `ReadyForQuery`, `RowDescription`,
     `DataRow`, `CommandComplete`, `ErrorResponse`, `NoticeResponse`,
-    `ParseComplete`, `BindComplete`, `NoData`, `EmptyQueryResponse`):
+    `ParseComplete`, `BindComplete`, `NoData`, `EmptyQueryResponse`,
+    `NotificationResponse` — the asynchronous LISTEN/NOTIFY message):
     a short buffer answers "need more bytes", a bad frame is a structural
     `PostgresError` — never a panic.
   - `Session` — the connection as a pure state machine (a consume type):
     feed server bytes in, drain client bytes out, read `PgEvent`s
     (`Authenticated`, `Parameter`, `BackendKey`, `Ready` with the transaction
     status, `RowDesc`, `Row` with raw `[]ParamValue` values, `Complete`,
-    `EmptyQuery`, `Notice`, `QueryError` with the SQLSTATE). Phases:
+    `EmptyQuery`, `Notice`, `QueryError` with the SQLSTATE, `Notify` — a
+    LISTEN/NOTIFY notification, legal in every phase, even mid-answer). Phases:
     `Authenticating → Startup → Ready ⇄ QuerySimple/QueryExtended`, plus
     `Closed` and `Failed`. Trust, cleartext, MD5 and SCRAM-SHA-256
     authentication; after a mid-query error the machine skips to the
@@ -60,6 +62,10 @@ the consumer through `nova-tls` (see `examples/live`).
   decodes a text column; `row.int_at` / `i16_at` / `i32_at` / `i64_at` /
   `f64_at` / `bool_at` decode typed columns (`bool_at` understands the
   wire format 't'/'f'; Postgres integers are signed, so no u* variants).
+  LISTEN/NOTIFY: a notification is buffered into a queue the moment it
+  arrives — idle or mid-query — and is read with `conn.next_event()`
+  (blocking; legal only between answers) or `conn.try_next_event()`
+  (non-blocking poll), as a `Notification { pid, channel, payload }`.
   Failures are structured `ConnError`
   variants (`Net`, `RefusedTls`, `Protocol`, `Auth`, `Server` with SQLSTATE
   and fields) — matchable, not strings. The SCRAM nonce is drawn from OS
@@ -81,7 +87,9 @@ the consumer through `nova-tls` (see `examples/live`).
   runs two queries on one connection with a for-in row iteration; `rowerr`
   surfaces a 42601 through the iterator (for-in to the end, then
   `conn.error()`), and the next
-  query on the same connection.
+  query on the same connection; `notify` runs LISTEN/NOTIFY live — a
+  blocking `next_event()` delivery and a mid-query notification buffered
+  for `try_next_event()`.
 - `src/*_test.nv` — peer tests: every encoder against reference bytes from
   the protocol documentation, every decoder against reference frames, every
   proper prefix answering "need more bytes", streams cut at every byte, the

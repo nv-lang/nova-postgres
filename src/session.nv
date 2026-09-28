@@ -75,7 +75,7 @@ export type PgEvent enum
     /// NOTIFY). Legal in every phase — between ReadyForQuery's while idle
     /// and interleaved with the messages of an in-flight answer. `pid` is
     /// the notifying backend's process id.
-    | Notification { pid int, channel str, payload str }
+    | Notify { pid int, channel str, payload str }
 
 /// The connection state machine. Pure: feed bytes in, drain bytes out, read
 /// events off each [`Session @feed`] call. Fields are private to the
@@ -499,7 +499,7 @@ fn Session mut @dispatch_query(msg ServerMessage, mut events []PgEvent) -> Resul
         // Asynchronous: a notification is legal in EVERY phase (even during
         // authentication or mid-error-skip) and never changes the phase.
         NotificationResponse { process_id, channel, payload } => {
-            events.push(PgEvent.Notification { pid: process_id, channel, payload })
+            events.push(PgEvent.Notify { pid: process_id, channel, payload })
             Ok(())
         }
         // Connection-level messages never reach this match (the first match

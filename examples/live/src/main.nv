@@ -109,6 +109,9 @@ fn run(host str, port int, mode str, argv []str) Fs Net Random -> Result[str, st
     if mode == "disable" {
         return plaintext_disable(host, port)
     }
+    if mode == "notify" {
+        return notify_mode(host, port)
+    }
     Err("unknown mode '${mode}'")
 }
 
@@ -607,6 +610,78 @@ fn plaintext_disable(host str, port int) Net Random -> Result[str, str] {
 }
 
 // ─── small helpers over the query results ──────────────────────────────────
+
+// Plan 286.1 step 3: LISTEN/NOTIFY live. conn1 LISTENs, conn2 notifies via
+// pg_notify (the parameterized form); assertions: nothing buffered before
+// any NOTIFY, a blocking next_event() delivers {channel, payload, pid}, and
+// a notification that lands MID-QUERY (during pg_sleep) is buffered and
+// comes out of try_next_event() afterwards — never confused with a row.
+fn notify_mode(host str, port int) Net Random -> Result[str, str] {
+    consume conn1 = match connect(host, port, "postgres", "smoke", "postgres") {
+        Ok(consume c) => c
+        Err(e) => return Err("conn1: ${e}")
+    }
+    match conn1.simple_query("LISTEN demo") {
+        Ok(_) => ()
+        Err(e) => return Err("LISTEN: ${e}")
+    }
+    match conn1.try_next_event() {
+        Some(n) => return Err("a notification before any NOTIFY: ${n.channel}")
+        None => ()
+    }
+    consume conn2 = match connect(host, port, "postgres", "smoke", "postgres") {
+        Ok(consume c) => c
+        Err(e) => return Err("conn2: ${e}")
+    }
+    match conn2.simple_query("SELECT pg_notify('demo', 'hello')") {
+        Ok(_) => ()
+        Err(e) => return Err("pg_notify: ${e}")
+    }
+    ro n = match conn1.next_event() {
+        Ok(n) => n
+        Err(e) => return Err("next_event: ${e}")
+    }
+    if n.channel != "demo" || n.payload != "hello" || n.pid <= 0 {
+        return Err("bad notification: ${n.pid} ${n.channel} '${n.payload}'")
+    }
+    println("live: next_event -> pid ${n.pid}, channel '${n.channel}', payload '${n.payload}'")
+    // Mid-query: the notification arrives while SELECT pg_sleep is running.
+    match conn2.simple_query("SELECT pg_notify('demo', 'mid')") {
+        Ok(_) => ()
+        Err(e) => return Err("pg_notify 2: ${e}")
+    }
+    match conn1.query("SELECT pg_sleep(0.3)") {
+        Ok(()) => ()
+        Err(e) => return Err("pg_sleep: ${e}")
+    }
+    mut rows = 0
+    for _row in conn1 {
+        rows += 1
+    }
+    match conn1.error() {
+        Some(e) => return Err("pg_sleep answer: ${e}")
+        None => ()
+    }
+    match conn1.try_next_event() {
+        Some(m) => {
+            if m.channel != "demo" || m.payload != "mid" {
+                return Err("bad mid-query notification: ${m.channel} '${m.payload}'")
+            }
+            println("live: mid-query notification buffered, try_next_event -> '${m.payload}'")
+        }
+        None => return Err("the mid-query notification was lost")
+    }
+    match conn2.close() {
+        Ok(()) => ()
+        Err(e) => return Err("conn2 close: ${e}")
+    }
+    match conn1.close() {
+        Ok(()) => ()
+        Err(e) => return Err("conn1 close: ${e}")
+    }
+    Ok("LISTEN/NOTIFY: blocking next_event delivered {pid, channel, payload}; a mid-query notification was buffered and polled with try_next_event")
+}
+
 
 fn single_text_value(mut stream TlsStream, mut session Session, sql str, what str) Net -> Result[str, str] {
     match session.query(sql) {
