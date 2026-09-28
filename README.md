@@ -66,6 +66,16 @@ the consumer through `nova-tls` (see `examples/live`).
   arrives — idle or mid-query — and is read with `conn.next_event()`
   (blocking; legal only between answers) or `conn.try_next_event()`
   (non-blocking poll), as a `Notification { pid, channel, payload }`.
+  `src/pgnet/listener.nv` adds the dedicated `Listener` (pq.Listener
+  parity): `Listener.new(...)`, `@listen`/`@unlisten`, then `@run(f)` /
+  `@run_n(n, f)` drive the loop — connect, LISTEN the channel set, deliver
+  `ListenerMsg` (`Note` / lifecycle `Event`: `Connected`, `Reconnecting`,
+  `Reconnected`) to the callback, and on a connection loss reconnect with
+  exponential backoff and re-LISTEN the channels. The listener owns each
+  connection inside `run` (a consume Connection cannot be stored in a
+  record field in this compiler); drive it on the caller's fiber — socket
+  work inside `spawn` is rejected by the M:N-safety pass
+  (E_FIBER_UNSAFE_CALL, see repro-local/integrator-report-d8c.md §7).
   Failures are structured `ConnError`
   variants (`Net`, `RefusedTls`, `Protocol`, `Auth`, `Server` with SQLSTATE
   and fields) — matchable, not strings. The SCRAM nonce is drawn from OS

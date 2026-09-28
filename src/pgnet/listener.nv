@@ -1,0 +1,206 @@
+// src/pgnet/listener.nv — the dedicated LISTEN/NOTIFY listener (plan 286.1
+// step 4), parity with pq.Listener: a connection owned by the listener,
+// automatic reconnect with exponential backoff, the channel set re-LISTENed
+// after every reconnect, events delivered as they come.
+//
+// Shape note: the pq/pgx API (`next_event` one event per call, the
+// connection stored in the listener between calls) is NOT expressible in
+// this compiler — a consume Connection cannot be stored in (or swapped
+// inside) a record field (no consume-field reassignment, and mixed
+// consume/plain record fields mis-layout across module boundaries). The
+// listener therefore DRIVES the loop itself: [`Listener @run`] owns the
+// connection for its whole lifetime and hands every event to the caller's
+// callback; cancellation is the fiber's (kill the fiber running `run`),
+// like pgx's ctx-cancel.
+
+module postgres.pgnet
+
+import std.time.duration
+
+/// A listener lifecycle event (pq.ListenerEvent* parity).
+export type ListenerEvent enum
+    /// The first connect succeeded; the channel set was LISTENed.
+    | Connected
+    /// The connection was lost (or refused); sleeping before the next
+    /// attempt. `reason` is the rendered ConnError.
+    | Reconnecting { reason str }
+    /// A reconnect succeeded; the channel set was re-LISTENed.
+    | Reconnected
+
+/// Everything the listener reports: either an asynchronous notification or
+/// a lifecycle event. Flat fields, not a nested record: a record inside an
+/// enum payload is a fragile mono shape in this compiler (see the module
+/// banner of conn.nv).
+export type ListenerMsg enum
+    | Note { pid int, channel str, payload str }
+    | Event { event ListenerEvent }
+
+/// One-line rendering (for logs and simple callbacks): rendering on the
+/// pgnet side keeps the payload extraction in the type's own module.
+export fn ListenerMsg @to_str() -> str =>
+    match @ {
+        Note { pid, channel, payload } => "note:${channel}:${payload} (pid ${pid})"
+        Event { event } => match event {
+            Connected => "connected"
+            Reconnected => "reconnected"
+            Reconnecting { reason } => "reconnecting: ${reason}"
+        }
+    }
+
+/// The dedicated listener. A plain value: it owns nothing between calls —
+/// `run` owns each connection locally for its whole lifetime (the compiler
+/// cannot store or swap a consume Connection in a record field; see the
+/// module banner).
+export type Listener value {
+    ro host str
+    ro port int
+    ro user str
+    ro password str
+    ro database str
+    ro min_backoff_ms int
+    ro max_backoff_ms int
+    /// Channels to LISTEN (deduplicated on add, re-issued after reconnect).
+    mut channels []str
+    /// The listener connected at least once (across run_n calls): the
+    /// first success reports Connected, later ones Reconnected.
+    mut connected_once bool
+}
+
+/// A listener for `database` at host:port. No network yet — the first
+/// connect happens inside [`Listener @run`]. `min_backoff_ms` is the sleep
+/// after the first failure, doubling up to `max_backoff_ms` (pq's
+/// NewListener shape).
+export fn Listener.new(host str, port int, user str, password str, database str, min_backoff_ms int, max_backoff_ms int) -> Listener {
+    Listener {
+        host,
+        port,
+        user,
+        password,
+        database,
+        min_backoff_ms,
+        max_backoff_ms,
+        channels: []str.new(),
+        connected_once: false,
+    }
+}
+
+/// Subscribe to a channel (deduplicated). Channel names are emitted into
+/// `LISTEN <name>` verbatim — use plain identifier names.
+export fn Listener mut @listen(channel str) -> () {
+    for c in @channels {
+        if c == channel {
+            return ()
+        }
+    }
+    @channels.push(channel)
+}
+
+/// Unsubscribe.
+export fn Listener mut @unlisten(channel str) -> () {
+    mut i = 0
+    while i < @channels.len() {
+        if @channels[i] == channel {
+            @channels.remove(i, 1)
+            return ()
+        }
+        i += 1
+    }
+}
+
+/// Number of subscribed channels (for tests and logs).
+export fn Listener @channels_count() -> int =>
+    @channels.len()
+
+/// Drive the listener, forever: connect, LISTEN the channel set, deliver
+/// every notification and lifecycle event to `f`; on a connection loss —
+/// report Reconnecting, sleep with exponential backoff (min..max,
+/// doubling), reconnect, re-LISTEN, report Reconnected. Never returns on
+/// its own; run it in a fiber and kill the fiber to stop (pgx ctx-cancel
+/// parity). A `close` of the process-fiber pair is the shutdown path.
+export fn Listener mut @run(f fn(ListenerMsg) -> ()) Net Random Time -> () {
+    @run_n(0, f)
+}
+
+/// [`Listener @run`] with an exit: returns after `max_notes` delivered
+/// notifications (0 = never, the pure run). Lifecycle events do not count.
+/// For scripts and tests that must get their process back.
+export fn Listener mut @run_n(max_notes int, f fn(ListenerMsg) -> ()) Net Random Time -> () {
+    mut backoff = @min_backoff_ms
+    mut delivered = 0
+    while true {
+        consume conn = match connect(@host, @port, @user, @password, @database) {
+            Ok(consume c) => c
+            Err(e) => {
+                f(ListenerMsg.Event { event: ListenerEvent.Reconnecting { reason: e.to_str() } })
+                backoff.to_millis().sleep()
+                backoff = @grow_backoff(backoff)
+                continue
+            }
+        }
+        // LISTEN every subscribed channel on the fresh connection. Inlined:
+        // a consume Connection passed to a mut parameter is a potential
+        // consume (D131), so it cannot leave this function's scope.
+        mut listen_err = ""
+        mut i = 0
+        while i < @channels.len() {
+            ro q = "LISTEN ${@channels[i]}"
+            match conn.simple_query(q) {
+                Ok(_) => ()
+                Err(e) => { listen_err = e.to_str() }
+            }
+            i += 1
+        }
+        if listen_err != "" {
+            f(ListenerMsg.Event { event: ListenerEvent.Reconnecting { reason: listen_err } })
+            ro _c = conn.close()
+        } else {
+            // The listener is truly ready only now: Connected/Reconnected
+            // after the re-LISTEN, so a notify sent on the event cannot
+            // race ahead of the LISTEN.
+            backoff = @min_backoff_ms
+            if @connected_once {
+                f(ListenerMsg.Event { event: ListenerEvent.Reconnected })
+            } else {
+                f(ListenerMsg.Event { event: ListenerEvent.Connected })
+                @connected_once = true
+            }
+            // Steady state: block on notifications until the connection
+            // dies or the note budget is spent. The connection is closed
+            // once per exit path — never twice, never left alive (D131).
+            mut reason = ""
+            mut finished = false
+            mut alive = true
+            while alive {
+                match conn.next_event() {
+                    Ok(n) => {
+                        f(ListenerMsg.Note { pid: n.pid, channel: n.channel, payload: n.payload })
+                        delivered += 1
+                        if max_notes > 0 && delivered >= max_notes {
+                            finished = true
+                            alive = false
+                        }
+                    }
+                    Err(e) => {
+                        reason = e.to_str()
+                        alive = false
+                    }
+                }
+            }
+            ro _c = conn.close()
+            if finished {
+                return ()
+            }
+            f(ListenerMsg.Event { event: ListenerEvent.Reconnecting { reason } })
+        }
+        backoff.to_millis().sleep()
+        backoff = @grow_backoff(backoff)
+    }
+}
+
+// Exponential backoff step, capped at the configured maximum.
+fn Listener @grow_backoff(cur int) -> int {
+    if cur * 2 > @max_backoff_ms {
+        return @max_backoff_ms
+    }
+    cur * 2
+}

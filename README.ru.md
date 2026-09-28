@@ -65,7 +65,16 @@ MD5) идёт чистыми шагами состояния. Ядро прот�
   складывается в очередь в момент прихода — в простое или посреди ответа —
   и читается `conn.next_event()` (блокирующе; только между ответами) или
   `conn.try_next_event()` (неблокирующий опрос) как
-  `Notification { pid, channel, payload }`. Отказы — структурные
+  `Notification { pid, channel, payload }`. `src/pgnet/listener.nv` —
+  выделенный `Listener` (паритет pq.Listener): `Listener.new(...)`,
+  `@listen`/`@unlisten`, затем `@run(f)` / `@run_n(n, f)` ведут цикл —
+  connect, LISTEN набора каналов, доставка `ListenerMsg` (`Note` /
+  события жизни: `Connected`, `Reconnecting`, `Reconnected`) в колбэк, а
+  при обрыве — переподключение с экспоненциальным backoff и повторный
+  LISTEN. Соединением владеет `run` (consume Connection не хранится в поле
+  записи в этом компиляторе); гонять — на файбере вызывающего: работа с
+  сокетом внутри `spawn` отклоняется M:N-проверкой (E_FIBER_UNSAFE_CALL,
+  см. repro-local/integrator-report-d8c.md §7). Отказы — структурные
   варианты `ConnError` (`Net`, `RefusedTls`,
   `Protocol`, `Auth`, `Server` с SQLSTATE и полями) — они матчатся, а не
   разбираются по тексту. Клиентский nonce SCRAM берётся из системного

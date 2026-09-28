@@ -47,11 +47,11 @@ module main
 
 import std.net.{TcpStream, real_net}
 import std.os.{real_os, args}
-import std.fs.{real_fs, read, Path}
+import std.fs.{real_fs, read, write_text, Path}
 import std.encoding.base64.{Base64}
 import tls.{TlsStream, ClientConfig, VerificationMode, TlsError, TlsVersion, Tls12, Tls13}
 import postgres.{Session, SessionPhase, PgEvent, ParamValue, Row, QueryError, Ready, ClientMessage, SslAnswer, TlsSupported, TlsRefused, PostgresError, Protocol, Malformed}
-import postgres.pgnet.{ConnError, connect, open_tcp, connect_plain, text_at, Connection}
+import postgres.pgnet.{ConnError, connect, open_tcp, connect_plain, text_at, Connection, Listener, ListenerMsg, ListenerEvent, Note, Event, Connected, Reconnected, Reconnecting}
 
 /// Whether and how to ask for TLS — slice Д8в criterion 2's TlsMode. It
 /// lives in the entry module (see the banner): pgnet imports no tls types.
@@ -75,7 +75,7 @@ fn main() {
     }
 }
 
-fn run(host str, port int, mode str, argv []str) Fs Net Random -> Result[str, str] {
+fn run(host str, port int, mode str, argv []str) Fs Net Random Time -> Result[str, str] {
     if mode == "ca" {
         ro ca = read_ca(argv)?
         ro name = argv.get(5) ?? host
@@ -111,6 +111,9 @@ fn run(host str, port int, mode str, argv []str) Fs Net Random -> Result[str, st
     }
     if mode == "notify" {
         return notify_mode(host, port)
+    }
+    if mode == "listener" {
+        return listener_mode(host, port)
     }
     Err("unknown mode '${mode}'")
 }
@@ -607,6 +610,32 @@ fn plaintext_disable(host str, port int) Net Random -> Result[str, str] {
     ro ssl = plain_ssl_value(conn)?
     println("live: Disable -> plaintext, no SSLRequest (pg_stat_ssl -> f)")
     Ok("Disable stayed in plaintext, pg_stat_ssl -> f")
+}
+
+// Plan 286.1 step 4: the dedicated Listener live, including a REAL
+// reconnect. NO fibers: this compiler's M:N-safety pass rejects driving a
+// Connection inside a spawn body (E_FIBER_UNSAFE_CALL — unguarded mutation,
+// D446), so bash orchestrates the timeline (NOTIFYs + docker restart) and
+// the program runs two bounded Listener phases (run_n returns after N
+// notifications, reconnects included):
+//
+//   phase 1: connect + LISTEN + first note;   bash restarts the container;
+//   phase 2: Reconnecting/backoff/Reconnected (re-LISTEN) + second note.
+fn listener_cb(m ListenerMsg) -> () {
+    println("live: ${m.to_str()}")
+}
+
+fn listener_mode(host str, port int) Net Random Time Fs -> Result[str, str] {
+    ro _m0 = write_text(Path.posix("target/listener-mark-0-start.txt"), "start")
+    mut ln = Listener.new(host, port, "postgres", "smoke", "postgres", 100, 1000)
+    ln.listen("demo")
+    ln.run_n(1, listener_cb)
+    ro _m1 = write_text(Path.posix("target/listener-mark-1-phase1.txt"), "phase1")
+    println("live: phase 1 done (first notification delivered)")
+    ln.run_n(1, listener_cb)
+    ro _m2 = write_text(Path.posix("target/listener-mark-2-phase2.txt"), "phase2")
+    println("live: phase 2 done (delivered after the reconnect)")
+    Ok("Listener: connect+LISTEN, note delivered; container restart -> Reconnecting/backoff/Reconnected with the channel re-LISTENed; note delivered again")
 }
 
 // ─── small helpers over the query results ──────────────────────────────────
