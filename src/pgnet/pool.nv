@@ -18,6 +18,18 @@
 // instead of pooling it (poisoned connections must not loop). Dropping
 // Pool without close() leaks the idle connections — close() is explicit,
 // as with Go's sql.DB.Close.
+//
+// Why no mutex: `mut @` is an exclusive borrow at the type level — two
+// fibers cannot hold mut access to one Pool, the checker rejects it at
+// compile time, so the out-counter and the idle vec are race-free by
+// construction (the sleep poll inside acquire keeps the borrow). Go's
+// pgxpool needs sync.Mutex + a resource channel because Go lets any
+// goroutine touch any object; Nova buys the same safety with linearity.
+// A Go-style pool SHARED across fibers is a different feature: it needs
+// a #share Pool with std's fiber-aware Mutex/AtomicI64 inside, and the
+// handed-out consume Connection must cross fiber boundaries — blocked
+// today by E_FIBER_UNSAFE_CALL for socket work (report §7), the same
+// language question as the listener's.
 
 module postgres.pgnet
 
