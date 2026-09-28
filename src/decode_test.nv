@@ -291,6 +291,34 @@ test "EmptyQueryResponse matches the documented bytes" {
     }
 }
 
+test "NotificationResponse matches the documented bytes" {
+    // Reference: «Message Formats» → «NotificationResponse» — tag 'A',
+    // int32 pid, then channel and payload as cstrings. Here pid 7,
+    // channel "demo", payload "hello".
+    ro reference = x"41 00 00 00 13 00 00 00 07 64 65 6D 6F 00 68 65 6C 6C 6F 00"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        NotificationResponse { process_id, channel, payload } => {
+            assert(process_id == 7, "pid ${process_id}")
+            assert(channel == "demo", "channel ${channel}")
+            assert(payload == "hello", "payload ${payload}")
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
+test "NotificationResponse with an empty payload" {
+    // An empty payload is a lone NUL cstring: pid 1, channel "c", payload "".
+    ro reference = x"41 00 00 00 0B 00 00 00 01 63 00 00"
+    assert_prefixes_need_more(reference)
+    match assert_decodes(reference) {
+        NotificationResponse { process_id, channel, payload } => {
+            assert(process_id == 1 && channel == "c" && payload == "")
+        }
+        _ => assert(false, "wrong variant")
+    }
+}
+
 test "unknown tag is a structural error" {
     // 'w' is not a backend message tag; decoding must fail structurally,
     // not panic and not ask for more bytes.

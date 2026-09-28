@@ -110,6 +110,10 @@ fn notice_response(msg str) -> []u8 {
     frame('N' as u8, fields)
 }
 
+// NotificationResponse ('A'): pid + channel + payload.
+fn notification(pid int, channel str, payload str) -> []u8 =>
+    frame('A' as u8, cat3(i32be(pid), cstr(channel), cstr(payload)))
+
 fn empty_query() -> []u8 =>
     frame('I' as u8, x"")
 
@@ -169,6 +173,7 @@ fn ev(e PgEvent) -> str =>
         EmptyQuery => "empty"
         Notice { fields } => "notice:${error_message(fields)}"
         QueryError { sqlstate, message } => "error:${sqlstate}:${message}"
+        Notification { pid, channel, payload } => "notify:${pid}:${channel}:${payload}"
     }
 
 fn row_render(values []ParamValue) -> str {

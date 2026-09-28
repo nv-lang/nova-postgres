@@ -71,6 +71,11 @@ export type PgEvent enum
     /// repro-local/query_error_live: 15/15 segfaults; the str payload
     /// survives 20/20).
     | QueryError { sqlstate str, message str }
+    /// A NotificationResponse the server pushed asynchronously (LISTEN /
+    /// NOTIFY). Legal in every phase — between ReadyForQuery's while idle
+    /// and interleaved with the messages of an in-flight answer. `pid` is
+    /// the notifying backend's process id.
+    | Notification { pid int, channel str, payload str }
 
 /// The connection state machine. Pure: feed bytes in, drain bytes out, read
 /// events off each [`Session @feed`] call. Fields are private to the
@@ -489,6 +494,12 @@ fn Session mut @dispatch_query(msg ServerMessage, mut events []PgEvent) -> Resul
                 return Err(@proto("NoData outside the extended describe step"))
             }
             @ext_stage = ExtExecute
+            Ok(())
+        }
+        // Asynchronous: a notification is legal in EVERY phase (even during
+        // authentication or mid-error-skip) and never changes the phase.
+        NotificationResponse { process_id, channel, payload } => {
+            events.push(PgEvent.Notification { pid: process_id, channel, payload })
             Ok(())
         }
         // Connection-level messages never reach this match (the first match

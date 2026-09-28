@@ -1,0 +1,137 @@
+// src/postgres/session_notify_test.nv — plan 286.1 step 2: a
+// NotificationResponse is legal in EVERY phase (idle, mid-query between
+// DataRows, mid error-skip), arrives as a PgEvent.Notification in order, and
+// survives any chunking of the server stream (cut at every point).
+// Shapes and helpers: session_fixtures.nv.
+
+module postgres
+
+// The mid-query server stream: RowDescription, one row, an interleaved
+// notification, the second row, CommandComplete, ReadyForQuery.
+fn notify_server() -> []u8 =>
+    cat4(row_desc("a"), data_row_text("1"), notification(7, "demo", "hello"),
+        cat3(data_row_text("2"), cmd_complete("SELECT 1"), ready('I' as u8)))
+
+fn notify_run(cut int) -> str {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(_) => ()
+        Err(e) => {
+            s.close()
+            return "!${e}"
+        }
+    }
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => {
+            s.close()
+            return "!${e}"
+        }
+    }
+    ro server = notify_server()
+    mut out = ""
+    if cut < 0 {
+        match s.feed(server) {
+            Ok(evs) => { out = render(evs) }
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+    } else {
+        mut all = match s.feed(server[..cut]) {
+            Ok(e) => e
+            Err(e) => {
+                s.close()
+                return "!${e}"
+            }
+        }
+        ro evs2 = match s.feed(server[cut..]) {
+            Ok(e2) => e2
+            Err(e) => {
+                s.close()
+                return "${render(all)}!${e}"
+            }
+        }
+        all.append(evs2)
+        out = render(all)
+    }
+    s.close()
+    out
+}
+
+test "notification while idle is an event, the session stays ready" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(e1.len() == 2, "notify: entry events")
+    ro evs = match s.feed(notification(9, "jobs", "x")) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "idle notify errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(evs.len() == 1, "notify: event count")
+    assert(ev(evs[0]) == "notify:9:jobs:x", "notify ev0: ${ev(evs[0])}")
+    // The session is still usable: a query round completes normally.
+    match s.query("SELECT 1") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query after notify errored: ${e}")
+    }
+    ro evs2 = match s.feed(cat3(row_desc("a"), cmd_complete("SELECT 1"), ready('I' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "query round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(render(evs2) == ";rowdesc:1:a:0;cc:SELECT 1;ready:I", "after: ${render(evs2)}")
+    s.close()
+}
+
+test "notification between DataRows keeps the event order" {
+    ro got = notify_run(-1)
+    assert(got == ";rowdesc:1:a:0;row|some:1;notify:7:demo:hello;row|some:2;cc:SELECT 1;ready:I", "got: ${got}")
+}
+
+test "notification stream cut at every point" {
+    ro whole = notify_run(-1)
+    mut cut = 0
+    while cut < notify_server().len() {
+        ro got = notify_run(cut)
+        assert(got == whole, "cut ${cut}: ${got}")
+        cut += 1
+    }
+}
+
+test "notification during error-skip is still delivered" {
+    consume s = Session.new("postgres", "smoke", "postgres", "n")
+    match s.feed(cat(auth_ok(), ready('I' as u8))) {
+        Ok(_) => ()
+        Err(e) => {
+            assert(false, "entry errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    match s.query("bogus") {
+        Ok(()) => ()
+        Err(e) => assert(false, "query errored: ${e}")
+    }
+    // ErrorResponse opens the skip; the notification arrives before the
+    // ReadyForQuery that closes the cycle.
+    ro evs = match s.feed(cat3(error_response("42601", "syntax error"), notification(3, "c", "p"), ready('E' as u8))) {
+        Ok(e) => e
+        Err(e) => {
+            assert(false, "error round errored: ${e}")
+            []PgEvent.new()
+        }
+    }
+    assert(render(evs) == ";error:42601:syntax error;notify:3:c:p;ready:E", "got: ${render(evs)}")
+    s.close()
+}

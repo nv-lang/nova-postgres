@@ -59,6 +59,10 @@ export type ServerMessage enum
     | CommandComplete { tag str }
     | ErrorResponse { fields []ErrorField }
     | NoticeResponse { fields []ErrorField }
+    /// NotificationResponse ('A'): an asynchronous LISTEN/NOTIFY message.
+    /// May arrive at any point of the stream, even between the messages of
+    /// an in-flight query answer.
+    | NotificationResponse { process_id int, channel str, payload str }
     | ParseComplete
     | BindComplete
     | NoData
@@ -141,6 +145,7 @@ fn decode_payload(tag u8, mut cur ReadBuffer, end int) -> Result[ServerMessage, 
     }
     if tag == 'E' as u8 { return decode_error_fields(cur, end, false) }
     if tag == 'N' as u8 { return decode_error_fields(cur, end, true) }
+    if tag == 'A' as u8 { return decode_notification(cur, end) }
     if tag == '1' as u8 {
         finish(cur, end, "ParseComplete")?
         return Ok(ParseComplete)
@@ -212,6 +217,16 @@ fn decode_backend_key_data(mut cur ReadBuffer, end int) -> Result[ServerMessage,
     ro pid = need_u32(cur, "BackendKeyData process id")?
     ro key = need_u32(cur, "BackendKeyData secret key")?
     Ok(BackendKeyData { process_id: pid, secret_key: key })
+}
+
+// NotificationResponse ('A'): int32 pid of the notifying backend, then the
+// channel and the payload as cstrings.
+fn decode_notification(mut cur ReadBuffer, end int) -> Result[ServerMessage, PostgresError] {
+    ro pid = need_u32(cur, "NotificationResponse process id")?
+    ro channel = cur.read_cstr("NotificationResponse channel")?
+    ro payload = cur.read_cstr("NotificationResponse payload")?
+    finish(cur, end, "NotificationResponse")?
+    Ok(NotificationResponse { process_id: pid, channel, payload })
 }
 
 fn decode_row_description(mut cur ReadBuffer, end int) -> Result[ServerMessage, PostgresError] {
