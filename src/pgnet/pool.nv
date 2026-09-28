@@ -1,0 +1,152 @@
+// src/pgnet/pool.nv — a connection pool over the pgnet adapter (parity with
+// pgxpool / database/sql's pool layer: the pool is NOT part of the driver
+// core, it only lends and reuses whole sessions).
+//
+// Layout: `idle` is a Vec[Connection] — since the Vec[T consume] wave
+// (plan 246) a vector of must-consume elements works: the consuming
+// `push(consume v)` takes ownership, `pop()` hands it back, and an
+// emptied vector is ended with `destroy_empty()`. Two call-shape rules
+// this compiler enforces (repro-local/chan_conn):
+//   * the type must be spelt `Vec[Connection]` — the `[]Connection` sugar
+//     resolves to a nameless type whose consume methods are invisible;
+//   * pushing a NAMED consume binding is a partial consume (reserve may
+//     fail before the move) — the failure path is covered by a
+//     `pushed`-flag defer (D189 shape; errdefer is removed).
+//
+// Lifecycle: acquire hands out ownership of a Connection, release takes
+// it back. A remembered FATAL error makes release close the connection
+// instead of pooling it (poisoned connections must not loop). Dropping
+// Pool without close() leaks the idle connections — close() is explicit,
+// as with Go's sql.DB.Close.
+
+module postgres.pgnet
+
+import std.collections.vec.{Vec}
+import std.time.duration
+
+/// A pool of ready PostgreSQL connections over one ConnectOptions.
+/// End it exactly once with [`Pool @close`].
+export type Pool consume {
+    opts ConnectOptions
+    consume idle Vec[Connection]
+    /// Borrowed right now (idle.len() + out never exceeds limit).
+    mut out int
+    /// Ceiling on live connections: idle + out <= limit always.
+    mut limit int
+}
+
+/// A pool lending at most `limit` live connections.
+export fn Pool.new(opts ConnectOptions, limit int) -> Pool =>
+    { opts, idle: Vec[Connection].new(), out: 0, limit: limit.max(1) }
+
+// The blocking wait's poll quantum. There is no consume-carrying
+// channel in std yet (the same generic consume-sink gap), so a waiter
+// sleeps on the fiber scheduler between pops — 1 ms keeps latency
+// negligible next to a network round trip.
+const ACQUIRE_POLL_MS int = 1
+
+/// Take a connection: a warm one from the pool, a fresh session while
+/// under the limit, or — at the limit — BLOCK (fiber-friendly sleep
+/// poll) until another fiber releases one.
+export fn Pool mut @acquire() Net Random Time -> Result[Connection, ConnError] {
+    match @idle.pop() {
+        Some(consume c) => {
+            @out += 1
+            return Ok(c)
+        }
+        None => ()
+    }
+    if @out < @limit {
+        @out += 1
+        match connect(@opts.host, @opts.port, @opts.user, @opts.password, @opts.database) {
+            Ok(consume c) => return Ok(c)
+            Err(e) => {
+                @out -= 1
+                return Err(e)
+            }
+        }
+    }
+    mut waiting = true
+    while waiting {
+        ACQUIRE_POLL_MS.to_millis().sleep()
+        match @idle.pop() {
+            Some(consume c) => {
+                @out += 1
+                return Ok(c)
+            }
+            None => ()
+        }
+    }
+    // Unreachable: the loop only exits via return. The compiler's
+    // definite-return analysis does not see through `waiting`.
+    Err(ConnError.PoolExhausted)
+}
+
+/// The non-blocking sibling of [`Pool @acquire`] (the try_*/blocking
+/// pair, D325): Ok at once, or `Err(PoolExhausted)` when the limit is
+/// reached and nothing is idle. Never waits.
+export fn Pool mut @try_acquire() Net Random -> Result[Connection, ConnError] {
+    match @idle.pop() {
+        Some(consume c) => {
+            @out += 1
+            return Ok(c)
+        }
+        None => ()
+    }
+    if @out < @limit {
+        @out += 1
+        match connect(@opts.host, @opts.port, @opts.user, @opts.password, @opts.database) {
+            Ok(consume c) => return Ok(c)
+            Err(e) => {
+                @out -= 1
+                return Err(e)
+            }
+        }
+    }
+    Err(ConnError.PoolExhausted)
+}
+
+/// Return a connection. A remembered fatal error (the connection is
+/// dead) closes it instead of pooling; anything else goes back warm —
+/// unread answers are drained by the next query's implicit
+/// ensure_drained, so a lazy release is safe.
+export fn Pool mut @release(consume conn Connection) Net -> () {
+    @out -= 1
+    mut poisoned = false
+    if conn.iter.err_set {
+        match conn.iter.err {
+            ConnError.Server { .. } => ()
+            _ => {
+                poisoned = true
+            }
+        }
+    }
+    if poisoned {
+        ro _r = conn.close()
+    } else {
+        // push of a named consume binding is a partial consume: cover
+        // the reserve-failure path by closing the connection ourselves.
+        mut pushed = false
+        defer {
+            if !pushed {
+                ro _r = conn.close()
+            }
+        }
+        @idle.push(conn)
+        pushed = true
+    }
+}
+
+/// End the pool: every idle connection gets a polite Terminate. Borrowed
+/// connections are their holders' business (their @close keeps working).
+export fn Pool consume @close() Net -> () {
+    while !@idle.is_empty() {
+        match @idle.pop() {
+            Some(consume c) => {
+                ro _r = c.close()
+            }
+            None => ()
+        }
+    }
+    @idle.destroy_empty()
+}
