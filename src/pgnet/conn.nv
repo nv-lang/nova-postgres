@@ -97,6 +97,9 @@ export type ConnError enum
     | Auth { error PostgresError }
     /// An ErrorResponse during the start-up phase: SQLSTATE + raw fields.
     | Server { sqlstate str, message str }
+    /// The pool's limit is reached and nothing is idle
+    /// ([`Pool @try_acquire`] only; the blocking [`Pool @acquire`] waits).
+    | PoolExhausted
 
 /// Human-readable, single-line description (for logs; match the VARIANT to
 /// branch on meaning).
