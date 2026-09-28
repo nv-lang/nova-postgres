@@ -72,10 +72,18 @@ the consumer through `nova-tls` (see `examples/live`).
   `ListenerMsg` (`Note` / lifecycle `Event`: `Connected`, `Reconnecting`,
   `Reconnected`) to the callback, and on a connection loss reconnect with
   exponential backoff and re-LISTEN the channels. The listener owns each
-  connection inside `run` (a consume Connection cannot be stored in a
-  record field in this compiler); drive it on the caller's fiber — socket
+  connection inside `run`; drive it on the caller's fiber — socket
   work inside `spawn` is rejected by the M:N-safety pass
   (E_FIBER_UNSAFE_CALL, see repro-local/integrator-report-d8c.md §7).
+  `src/pgnet/pool.nv` adds the `Pool` (pgxpool / database/sql parity):
+  `Pool.new(opts, limit)`, the blocking `@acquire()` and its
+  non-blocking sibling `@try_acquire()` (`Err(PoolExhausted)` at the
+  limit), `@release(conn)` — a connection with a remembered fatal error
+  is closed instead of pooled — and `@close()` (polite Terminate for
+  every idle connection). Idle connections live in a
+  `Vec[Connection]` (the Vec[T consume] wave); the blocking acquire is a
+  fiber-friendly 1 ms sleep poll because std channels do not carry
+  consume values yet.
   Failures are structured `ConnError`
   variants (`Net`, `RefusedTls`, `Protocol`, `Auth`, `Server` with SQLSTATE
   and fields) — matchable, not strings. The SCRAM nonce is drawn from OS
@@ -99,7 +107,9 @@ the consumer through `nova-tls` (see `examples/live`).
   `conn.error()`), and the next
   query on the same connection; `notify` runs LISTEN/NOTIFY live — a
   blocking `next_event()` delivery and a mid-query notification buffered
-  for `try_next_event()`.
+  for `try_next_event()`; `pool` exercises the Pool: two live connections
+  under limit 2, `PoolExhausted` on the third `try_acquire`, and warm
+  reuse of a released connection (same `pg_backend_pid`).
 - `src/*_test.nv` — peer tests: every encoder against reference bytes from
   the protocol documentation, every decoder against reference frames, every
   proper prefix answering "need more bytes", streams cut at every byte, the
