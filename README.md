@@ -85,7 +85,7 @@ the consumer through `nova-tls` (see `examples/live`).
   fiber-friendly 1 ms sleep poll because std channels do not carry
   consume values yet.
   Failures are structured `ConnError`
-  variants (`Net`, `RefusedTls`, `Protocol`, `Auth`, `Server` with SQLSTATE
+  variants (`Transport`, `RefusedTls`, `Protocol`, `Auth`, `Server` with SQLSTATE
   and fields) — matchable, not strings. The SCRAM nonce is drawn from OS
   randomness here, at the edge. TLS itself is composed by the consumer
   through `nova-tls` (see `examples/live`; pgnet imports no tls types —
@@ -180,13 +180,14 @@ docker stop nova-pg-smoke
 ```
 
 Live session checks and the TLS live run (Docker picks free ports; the TLS
-container recipe with your own CA is in `BRIEF-D8c.md`):
+container generates its own CA and server certificate inside the container —
+the postgres:15 image ships openssl):
 
 ```sh
 ./nova.sh build examples/session-check/src/main.nv -o target/session-check.exe
 ./target/session-check.exe
-# TLS container with your own CA (recipe in BRIEF-D8c.md) + a plain one:
-docker run --rm -d --name nova-pg-d8c-tls  -e POSTGRES_PASSWORD=smoke -p 127.0.0.1::5432 postgres:15 bash -c '...'
+# TLS container with its own CA (certificate for CN=localhost, SAN 127.0.0.1):
+docker run --rm -d --name nova-pg-d8c-tls -e POSTGRES_PASSWORD=smoke -p 127.0.0.1::5432 postgres:15 bash -c 'cd /var/lib/postgresql && openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=nova-test-ca -keyout ca.key -out ca.crt 2>/dev/null && openssl req -newkey rsa:2048 -nodes -subj /CN=localhost -keyout server.key -out server.csr 2>/dev/null && printf "subjectAltName=DNS:localhost,IP:127.0.0.1" > san.ext && openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 -extfile san.ext -out server.crt 2>/dev/null && chown postgres:postgres server.key server.crt && chmod 600 server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key'
 docker run --rm -d --name nova-pg-d8c-plain -e POSTGRES_PASSWORD=smoke -p 127.0.0.1::5432 postgres:15
 docker port nova-pg-d8c-tls 5432                 # -> 127.0.0.1:<tls-port>
 docker port nova-pg-d8c-plain 5432               # -> 127.0.0.1:<plain-port>
@@ -198,7 +199,14 @@ docker cp nova-pg-d8c-tls:/var/lib/postgresql/ca.crt target/pg-ca.crt
 ./target/live.exe 127.0.0.1 <plain-port> require
 ./target/live.exe 127.0.0.1 <plain-port> prefer target/pg-ca.crt
 ./target/live.exe 127.0.0.1 <plain-port> disable
+./target/live.exe 127.0.0.1 <plain-port> multi
+./target/live.exe 127.0.0.1 <plain-port> rowerr
+./target/live.exe 127.0.0.1 <plain-port> notify
+./target/live.exe 127.0.0.1 <plain-port> pool
 docker stop nova-pg-d8c-tls nova-pg-d8c-plain
 ```
+
+(Git Bash rewrites absolute container paths in `docker exec ...`; use
+`docker cp` as above, or prefix the path with `//`.)
 
 License: MIT OR Apache-2.0.
