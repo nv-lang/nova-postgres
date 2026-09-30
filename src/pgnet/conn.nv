@@ -35,7 +35,7 @@ module postgres.pgnet
 
 import std.net.{TcpStream, NetError}
 import std.encoding.base64.{Base64}
-import postgres.{Session, SessionPhase, PgEvent, ParamValue, PostgresError, ErrorField, Auth, ClientMessage, QueryError, Ready, SslAnswer, TlsRefused}
+import postgres.{Session, SessionPhase, PgEvent, ParamValue, PostgresError, ClientMessage, Ready, SslAnswer}
 
 /// (Slice Д8в criterion 2 names TlsMode - Disable/Prefer/Require. The
 /// MODE TYPE lives in the consumer's entry module: this compiler breaks
@@ -79,12 +79,15 @@ export fn ConnectOptions @cert_server_name() -> str {
 /// The structured adapter error (slice Д8в criterion 3): every failure
 /// branch is distinguishable by VARIANT, the message text is not the only
 /// carrier of meaning. `Tls` keeps the nova-tls error whole (match on its
-/// kind: CertificateInvalid, HostnameMismatch, ...); `Protocol`/`Auth`
-/// carry the package's own PostgresError; `Server` carries the SQLSTATE
-/// and the raw fields of a startup-phase ErrorResponse.
+/// kind: CertificateInvalid, HostnameMismatch, ...); `ProtocolViolation`/
+/// `AuthFailed` carry the package's own PostgresError; `Server` carries
+/// the SQLSTATE and the raw fields of a startup-phase ErrorResponse.
+/// (The variant names must not collide with PostgresErrorKind's: match
+/// arms resolve variant names across enums in the compilation unit —
+/// repro-local/record_enum_tag.)
 export type ConnError enum
     /// Transport read/write on the plain socket.
-    | Net { error NetError }
+    | Transport { error NetError }
     /// Placeholder for TLS failures in callers that match ConnError
     /// alongside their own TLS error type (pgnet keeps no tls types; see
     /// the module banner).
@@ -92,9 +95,9 @@ export type ConnError enum
     /// The server answered 'N' to SSLRequest while TLS was required.
     | RefusedTls
     /// A protocol violation (decoder or session state machine).
-    | Protocol { error PostgresError }
+    | ProtocolViolation { error PostgresError }
     /// The server rejected authentication (SQLSTATE 28P01 and friends).
-    | Auth { error PostgresError }
+    | AuthFailed { error PostgresError }
     /// An ErrorResponse during the start-up phase: SQLSTATE + raw fields.
     | Server { sqlstate str, message str }
     /// The pool's limit is reached and nothing is idle
@@ -105,12 +108,13 @@ export type ConnError enum
 /// branch on meaning).
 export fn ConnError @to_str() -> str =>
     match @ {
-        Net { error } => "network: ${error}"
+        Transport { error } => "network: ${error.to_str()}"
         TlsUnavailable => "tls error (see the caller's TLS error type)"
         RefusedTls => "server refused TLS (Require)"
-        Protocol { error } => "${error}"
-        Auth { error } => "${error}"
+        ProtocolViolation { error } => "${error.to_str()}"
+        AuthFailed { error } => "${error.to_str()}"
         Server { sqlstate, message } => "server error ${sqlstate}: ${message}"
+        PoolExhausted => "pool exhausted (limit reached, nothing idle)"
     }
 
 // Build the Server variant from the event's pre-rendered parts. The
@@ -140,7 +144,7 @@ export fn open_tcp(host str, port int) Net -> Result[TcpStream, ConnError] {
     ro addr = "${host}:${port}"
     match TcpStream.connect(addr) {
         Ok(consume s) => Ok(s)
-        Err(e) => Err(ConnError.Net { error: e })
+        Err(e) => Err(ConnError.Transport { error: e })
     }
 }
 
@@ -156,18 +160,18 @@ export fn open_tcp(host str, port int) Net -> Result[TcpStream, ConnError] {
 export fn request_ssl(mut stream TcpStream) Net -> Result[SslAnswer, ConnError] {
     match stream.write_all(ClientMessage.ssl_request()) {
         Ok(()) => ()
-        Err(e) => return Err(ConnError.Net { error: e })
+        Err(e) => return Err(ConnError.Transport { error: e })
     }
     ro answer = match stream.read_bytes(1) {
         Ok(b) => b
-        Err(e) => return Err(ConnError.Net { error: e })
+        Err(e) => return Err(ConnError.Transport { error: e })
     }
     if answer.len() == 0 {
         ro pe = PostgresError { kind: Protocol { what: "server closed the connection without answering SSLRequest" } }
-        return Err(ConnError.Protocol { error: pe })
+        return Err(ConnError.ProtocolViolation { error: pe })
     }
     match SslAnswer.classify(answer[0]) {
-        Err(pe) => Err(ConnError.Protocol { error: pe })
+        Err(pe) => Err(ConnError.ProtocolViolation { error: pe })
         Ok(a) => Ok(a)
     }
 }
@@ -280,7 +284,7 @@ export fn Connection mut @query(q str) Net -> Result[(), ConnError] {
     }
     match @session.query(q) {
         Ok(()) => ()
-        Err(e) => return Err(ConnError.Protocol { error: e })
+        Err(e) => return Err(ConnError.ProtocolViolation { error: e })
     }
     @iter.pending.truncate(0)
     @iter.pos = 0
@@ -391,8 +395,9 @@ fn Connection mut @pump_once() Net -> Result[(), ConnError] {
         Err(e) => return Err(e)
     }
     if chunk.len() == 0 {
-        ro pe = PostgresError { kind: Protocol { what: "server closed the connection" } }
-        return Err(ConnError.Protocol { error: pe })
+        // A clean EOF mid-read is a transport fact, not a protocol
+        // violation (a backend kill lands exactly here).
+        return Err(ConnError.Transport { error: NetError.Eof })
     }
     match @session.feed(chunk) {
         Ok(evs) => {
@@ -478,7 +483,7 @@ export fn Connection mut @try_next_event() -> Option[Notification] {
 export fn Connection mut @next_event() Net -> Result[Notification, ConnError] {
     if !@iter.done {
         ro pe = PostgresError { kind: Protocol { what: "next_event while an answer is in flight (finish or skip it first)" } }
-        return Err(ConnError.Protocol { error: pe })
+        return Err(ConnError.ProtocolViolation { error: pe })
     }
     while true {
         match @try_next_event() {
@@ -567,8 +572,8 @@ export fn PgEvent @text_at(i int) -> Result[str, ConnError] {
     match @ {
         Row { values } => {
             if i < 0 || i >= values.len() {
-                ro pe = PostgresError { kind: Malformed { what: "column index out of range" } }
-                return Err(ConnError.Protocol { error: pe })
+                ro pe = PostgresError { kind: MalformedPayload { what: "column index out of range" } }
+                return Err(ConnError.ProtocolViolation { error: pe })
             }
             ro v = values[i]
             match v.data {
@@ -576,18 +581,18 @@ export fn PgEvent @text_at(i int) -> Result[str, ConnError] {
                     Ok(t) => Ok(t)
                     Err(_) => {
                         ro pe = PostgresError { kind: Utf8 { what: "row value" } }
-                        Err(ConnError.Protocol { error: pe })
+                        Err(ConnError.ProtocolViolation { error: pe })
                     }
                 }
                 None => {
-                    ro pe = PostgresError { kind: Malformed { what: "row value is NULL" } }
-                    Err(ConnError.Protocol { error: pe })
+                    ro pe = PostgresError { kind: MalformedPayload { what: "row value is NULL" } }
+                    Err(ConnError.ProtocolViolation { error: pe })
                 }
             }
         }
         _ => {
             ro pe = PostgresError { kind: Protocol { what: "expected a DataRow event" } }
-            Err(ConnError.Protocol { error: pe })
+            Err(ConnError.ProtocolViolation { error: pe })
         }
     }
 }
@@ -596,9 +601,9 @@ export fn PgEvent @text_at(i int) -> Result[str, ConnError] {
 /// call sites that hold the event indirectly.
 export fn text_at(row PgEvent, i int) -> Result[str, ConnError] =>
     row.text_at(i)
-// Structured Malformed error with the offending value in the message.
+// Structured MalformedPayload error with the offending value in the message.
 fn malformed(what str) -> ConnError =>
-    ConnError.Protocol { error: PostgresError { kind: Malformed { what } } }
+    ConnError.ProtocolViolation { error: PostgresError { kind: MalformedPayload { what } } }
 
 /// Column i decoded as an integer (Postgres int/serial family, any size
 /// Nova's int parses). The chainable form: `row.int_at(0)?`.
@@ -671,7 +676,7 @@ export fn PgEvent @bool_at(i int) -> Result[bool, ConnError] =>
 fn simple_query_plain(mut conn Connection, q str) Net -> Result[[]PgEvent, ConnError] {
     match conn.session.query(q) {
         Ok(()) => ()
-        Err(e) => return Err(ConnError.Protocol { error: e })
+        Err(e) => return Err(ConnError.ProtocolViolation { error: e })
     }
     pump_plain(conn)
 }
@@ -679,7 +684,7 @@ fn simple_query_plain(mut conn Connection, q str) Net -> Result[[]PgEvent, ConnE
 fn extended_query_plain(mut conn Connection, sql str, params []ParamValue) Net -> Result[[]PgEvent, ConnError] {
     match conn.session.query_extended(sql, [], params, []) {
         Ok(()) => ()
-        Err(e) => return Err(ConnError.Protocol { error: e })
+        Err(e) => return Err(ConnError.ProtocolViolation { error: e })
     }
     pump_plain(conn)
 }
@@ -687,14 +692,14 @@ fn extended_query_plain(mut conn Connection, sql str, params []ParamValue) Net -
 fn write_stream(mut s TcpStream, data []u8) Net -> Result[(), ConnError] {
     match s.write_all(data) {
         Ok(()) => Ok(())
-        Err(e) => Err(ConnError.Net { error: e })
+        Err(e) => Err(ConnError.Transport { error: e })
     }
 }
 
 fn read_stream(mut s TcpStream, max int) Net -> Result[[]u8, ConnError] {
     match s.read_bytes(max) {
         Ok(b) => Ok(b)
-        Err(e) => Err(ConnError.Net { error: e })
+        Err(e) => Err(ConnError.Transport { error: e })
     }
 }
 
@@ -728,7 +733,7 @@ fn startup_check_plain(consume conn Connection, evs []PgEvent) Net -> Result[Con
     if conn.session.phase() != SessionPhase.Ready {
         ro e = PostgresError { kind: Protocol { what: "connection left the start-up phase without ReadyForQuery" } }
         ro _c = conn.close()
-        return Err(ConnError.Protocol { error: e })
+        return Err(ConnError.ProtocolViolation { error: e })
     }
     Ok(conn)
 }
@@ -742,8 +747,7 @@ fn pump_plain(mut conn Connection) Net -> Result[[]PgEvent, ConnError] {
         }
         ro chunk = read_stream(conn.stream, 65536)?
         if chunk.len() == 0 {
-            ro pe = PostgresError { kind: Protocol { what: "server closed the connection" } }
-            return Err(ConnError.Protocol { error: pe })
+            return Err(ConnError.Transport { error: NetError.Eof })
         }
         ro evs = match conn.session.feed(chunk) {
             Ok(e) => e
@@ -770,8 +774,8 @@ fn pump_plain(mut conn Connection) Net -> Result[[]PgEvent, ConnError] {
 // the server rejected authentication; anything else is a protocol failure.
 fn session_error(e PostgresError) -> ConnError {
     match e.kind {
-        Auth { .. } => ConnError.Auth { error: e }
-        _ => ConnError.Protocol { error: e }
+        Auth { .. } => ConnError.AuthFailed { error: e }
+        _ => ConnError.ProtocolViolation { error: e }
     }
 }
 
