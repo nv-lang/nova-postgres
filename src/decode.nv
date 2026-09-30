@@ -191,7 +191,7 @@ fn decode_auth(mut cur ReadBuffer, end int) -> Result[ServerMessage, PostgresErr
         }
         ro terminator = need_u8(cur, "SASL mechanism list terminator")?
         if terminator != 0 {
-            return Err(PostgresError { kind: Malformed { what: "SASL mechanism list terminator" } })
+            return Err(PostgresError { kind: MalformedPayload { what: "SASL mechanism list terminator" } })
         }
         return Ok(AuthenticationSasl { mechanisms: mechs })
     }
@@ -262,7 +262,7 @@ fn decode_data_row(mut cur ReadBuffer, end int) -> Result[ServerMessage, Postgre
         if len == -1 {
             values.push(ParamValue.null())
         } else if len < 0 {
-            return Err(PostgresError { kind: Malformed { what: "DataRow value length below -1" } })
+            return Err(PostgresError { kind: MalformedPayload { what: "DataRow value length below -1" } })
         } else {
             ro bytes = need_bytes(cur, len, "DataRow value")?
             values.push(ParamValue.binary(bytes))
@@ -358,12 +358,12 @@ fn need_rest(mut cur ReadBuffer, end int, what str) -> Result[[]u8, PostgresErro
 // Payload must end exactly at the frame end `end` (the absolute offset
 // 1 + len). Reading PAST it means the layout outran the declared length
 // (Truncated — the slice-bounded cursor used to fail the read); landing
-// BEFORE it means bytes the documented layout does not consume (Malformed).
+// BEFORE it means bytes the documented layout does not consume (MalformedPayload).
 fn finish(cur ReadBuffer, end int, what str) -> Result[(), PostgresError] {
     if cur.position() > end {
         Err(PostgresError { kind: Truncated { what } })
     } else if cur.position() < end {
-        Err(PostgresError { kind: Malformed { what } })
+        Err(PostgresError { kind: MalformedPayload { what } })
     } else {
         Ok(())
     }

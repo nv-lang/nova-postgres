@@ -34,7 +34,7 @@ export type PostgresErrorKind enum
     /// read (unterminated string, truncated integer, ...).
     | Truncated { what str }
     /// Message payload carried bytes past where the documented layout ends.
-    | Malformed { what str }
+    | MalformedPayload { what str }
     /// An authentication exchange produced data that does not parse
     /// (bad server-first/server-final attributes, missing mechanism, ...).
     | Auth { what str }
@@ -54,7 +54,7 @@ export fn PostgresError @to_str() -> str =>
         LengthOverflow { len } => "declared message length ${len} exceeds the 1 GiB protocol maximum"
         BadLength { len } => "declared message length ${len} is below the minimum of 4"
         Truncated { what } => "truncated ${what}"
-        Malformed { what } => "malformed ${what}"
+        MalformedPayload { what } => "malformed ${what}"
         Auth { what } => "authentication failure: ${what}"
         BadServerSignature => "SCRAM server signature mismatch"
         Utf8 { what } => "invalid UTF-8 in ${what}"

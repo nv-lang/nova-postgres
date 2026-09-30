@@ -58,7 +58,7 @@ test "any other server signature is a structural error" {
             LengthOverflow { len } => assert(false, "wrong kind")
             BadLength { len } => assert(false, "wrong kind")
             Truncated { what } => assert(false, "wrong kind")
-            Malformed { what } => assert(false, "wrong kind")
+            MalformedPayload { what } => assert(false, "wrong kind")
             Auth { what } => assert(false, "wrong kind")
             Utf8 { what } => assert(false, "wrong kind")
         }
@@ -76,7 +76,7 @@ test "server nonce not extending the client nonce is a structural error" {
             LengthOverflow { len } => assert(false, "wrong kind")
             BadLength { len } => assert(false, "wrong kind")
             Truncated { what } => assert(false, "wrong kind")
-            Malformed { what } => assert(false, "wrong kind")
+            MalformedPayload { what } => assert(false, "wrong kind")
             BadServerSignature => assert(false, "wrong kind")
             Utf8 { what } => assert(false, "wrong kind")
         }
@@ -93,7 +93,7 @@ test "verify before respond is a structural error" {
             LengthOverflow { len } => assert(false, "wrong kind")
             BadLength { len } => assert(false, "wrong kind")
             Truncated { what } => assert(false, "wrong kind")
-            Malformed { what } => assert(false, "wrong kind")
+            MalformedPayload { what } => assert(false, "wrong kind")
             BadServerSignature => assert(false, "wrong kind")
             Utf8 { what } => assert(false, "wrong kind")
         }
