@@ -66,6 +66,17 @@ export type Listener value {
     mut connected_once bool
 }
 
+/// What one [`Listener @run_n`] call delivered, counted by the listener
+/// itself (the callback is a plain fn pointer and cannot count for the
+/// caller). Lets a script assert "the reconnect really happened" instead
+/// of trusting the log.
+export type ListenerRun value {
+    ro notes int
+    ro connecteds int
+    ro reconnectings int
+    ro reconnecteds int
+}
+
 /// A listener for `database` at host:port. No network yet — the first
 /// connect happens inside [`Listener @run`]. `min_backoff_ms` is the sleep
 /// after the first failure, doubling up to `max_backoff_ms` (pq's
@@ -118,20 +129,26 @@ export fn Listener @channels_count() -> int =>
 /// its own; run it in a fiber and kill the fiber to stop (pgx ctx-cancel
 /// parity). A `close` of the process-fiber pair is the shutdown path.
 export fn Listener mut @run(f fn(ListenerMsg) -> ()) Net Random Time -> () {
-    @run_n(0, f)
+    ro _s = @run_n(0, f)
 }
 
 /// [`Listener @run`] with an exit: returns after `max_notes` delivered
 /// notifications (0 = never, the pure run). Lifecycle events do not count.
-/// For scripts and tests that must get their process back.
-export fn Listener mut @run_n(max_notes int, f fn(ListenerMsg) -> ()) Net Random Time -> () {
+/// The returned [`ListenerRun`] counts what this call actually delivered —
+/// assert on it; the callback cannot count for you (plain fn pointer).
+export fn Listener mut @run_n(max_notes int, f fn(ListenerMsg) -> ()) Net Random Time -> ListenerRun {
     mut backoff = @min_backoff_ms
     mut delivered = 0
+    mut notes = 0
+    mut connecteds = 0
+    mut reconnectings = 0
+    mut reconnecteds = 0
     while true {
         consume conn = match connect(@host, @port, @user, @password, @database) {
             Ok(consume c) => c
             Err(e) => {
                 f(ListenerMsg.Event { event: ListenerEvent.Reconnecting { reason: e.to_str() } })
+                reconnectings += 1
                 backoff.to_millis().sleep()
                 backoff = @grow_backoff(backoff)
                 continue
@@ -152,6 +169,7 @@ export fn Listener mut @run_n(max_notes int, f fn(ListenerMsg) -> ()) Net Random
         }
         if listen_err != "" {
             f(ListenerMsg.Event { event: ListenerEvent.Reconnecting { reason: listen_err } })
+            reconnectings += 1
             ro _c = conn.close()
         } else {
             // The listener is truly ready only now: Connected/Reconnected
@@ -160,8 +178,10 @@ export fn Listener mut @run_n(max_notes int, f fn(ListenerMsg) -> ()) Net Random
             backoff = @min_backoff_ms
             if @connected_once {
                 f(ListenerMsg.Event { event: ListenerEvent.Reconnected })
+                reconnecteds += 1
             } else {
                 f(ListenerMsg.Event { event: ListenerEvent.Connected })
+                connecteds += 1
                 @connected_once = true
             }
             // Steady state: block on notifications until the connection
@@ -174,6 +194,7 @@ export fn Listener mut @run_n(max_notes int, f fn(ListenerMsg) -> ()) Net Random
                 match conn.next_event() {
                     Ok(n) => {
                         f(ListenerMsg.Note { pid: n.pid, channel: n.channel, payload: n.payload })
+                        notes += 1
                         delivered += 1
                         if max_notes > 0 && delivered >= max_notes {
                             finished = true
@@ -188,13 +209,15 @@ export fn Listener mut @run_n(max_notes int, f fn(ListenerMsg) -> ()) Net Random
             }
             ro _c = conn.close()
             if finished {
-                return ()
+                return { notes, connecteds, reconnectings, reconnecteds }
             }
             f(ListenerMsg.Event { event: ListenerEvent.Reconnecting { reason } })
+            reconnectings += 1
         }
         backoff.to_millis().sleep()
         backoff = @grow_backoff(backoff)
     }
+    { notes, connecteds, reconnectings, reconnecteds }
 }
 
 // Exponential backoff step, capped at the configured maximum.
