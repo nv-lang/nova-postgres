@@ -17,3 +17,6 @@ nova.sh
 # Minimal compiler-behaviour repro programs (D8b §3) — local working material,
 # the integrator re-runs them from the hand-over, they are not package code.
 repro-local/
+
+# Чужой локальный мусор других инструментов
+scratch-opencode/
