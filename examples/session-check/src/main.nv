@@ -241,7 +241,7 @@ fn chk_criterion_2_trust_entry_dialog() -> () {
     ro evs = match s.feed(trust_server()) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "feed errored: ${e}")
+            assert(false, "feed errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -263,7 +263,7 @@ fn chk_criterion_2_cleartext_entry_dialog() -> () {
     ro evs1 = match s.feed(auth_cleartext()) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "cleartext request errored: ${e}")
+            assert(false, "cleartext request errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -271,7 +271,7 @@ fn chk_criterion_2_cleartext_entry_dialog() -> () {
     ro evs2 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "cleartext finish errored: ${e}")
+            assert(false, "cleartext finish errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -288,7 +288,7 @@ fn chk_criterion_2_md5_entry_dialog() -> () {
     ro evs1 = match s.feed(auth_md5()) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "md5 request errored: ${e}")
+            assert(false, "md5 request errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -296,7 +296,7 @@ fn chk_criterion_2_md5_entry_dialog() -> () {
     ro evs2 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "md5 finish errored: ${e}")
+            assert(false, "md5 finish errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -318,7 +318,7 @@ fn chk_criterion_2_scram_entry_dialog() -> () {
     ro e1 = match s.feed(auth_sasl()) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "sasl request errored: ${e}")
+            assert(false, "sasl request errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -326,7 +326,7 @@ fn chk_criterion_2_scram_entry_dialog() -> () {
     ro e2 = match s.feed(sasl_continue(server_first)) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "sasl continue errored: ${e}")
+            assert(false, "sasl continue errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -334,7 +334,7 @@ fn chk_criterion_2_scram_entry_dialog() -> () {
     ro e3 = match s.feed(sasl_final("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "sasl final errored: ${e}")
+            assert(false, "sasl final errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -342,7 +342,7 @@ fn chk_criterion_2_scram_entry_dialog() -> () {
     ro e4 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "scram finish errored: ${e}")
+            assert(false, "scram finish errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -361,7 +361,7 @@ fn chk_criterion_2_wrong_password_is_a_structural_auth_() -> () {
     ro _e1 = match s.feed(auth_cleartext()) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "cleartext request errored: ${e}")
+            assert(false, "cleartext request errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -404,14 +404,14 @@ fn cleartext_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step0[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -421,7 +421,7 @@ fn cleartext_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -430,14 +430,14 @@ fn cleartext_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step1[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -447,7 +447,7 @@ fn cleartext_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -481,14 +481,14 @@ fn md5_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step0[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -498,7 +498,7 @@ fn md5_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -507,14 +507,14 @@ fn md5_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step1[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -524,7 +524,7 @@ fn md5_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -558,14 +558,14 @@ fn wrong_password_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step0[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -575,7 +575,7 @@ fn wrong_password_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -584,14 +584,14 @@ fn wrong_password_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step1[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -601,7 +601,7 @@ fn wrong_password_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -635,14 +635,14 @@ fn empty_query_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step0[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -652,27 +652,27 @@ fn empty_query_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
     match s.query("   ") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     if split_step == 1 && cut >= 0 {
         mut all = match s.feed(step1[..cut]) {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step1[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -682,7 +682,7 @@ fn empty_query_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -716,14 +716,14 @@ fn notice_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step0[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -733,27 +733,27 @@ fn notice_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     if split_step == 1 && cut >= 0 {
         mut all = match s.feed(step1[..cut]) {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step1[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -763,7 +763,7 @@ fn notice_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -800,14 +800,14 @@ fn scram_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step0[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -817,7 +817,7 @@ fn scram_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -826,14 +826,14 @@ fn scram_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step1[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -843,7 +843,7 @@ fn scram_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -852,14 +852,14 @@ fn scram_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step2[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -869,7 +869,7 @@ fn scram_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -878,14 +878,14 @@ fn scram_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step3[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -895,7 +895,7 @@ fn scram_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -943,14 +943,14 @@ fn ext_error_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step0[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -960,27 +960,27 @@ fn ext_error_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
     match s.query_extended("SELECT bogus", [], [], []) {
         Ok(()) => ()
-        Err(e) => assert(false, "extended query errored: ${e}")
+        Err(e) => assert(false, "extended query errored: ${e.to_str()}")
     }
     if split_step == 1 && cut >= 0 {
         mut all = match s.feed(step1[..cut]) {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step1[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -990,27 +990,27 @@ fn ext_error_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     if split_step == 2 && cut >= 0 {
         mut all = match s.feed(step2[..cut]) {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step2[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -1020,7 +1020,7 @@ fn ext_error_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -1061,14 +1061,14 @@ fn ps_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step0[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -1078,7 +1078,7 @@ fn ps_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -1087,14 +1087,14 @@ fn ps_run(split_step int, cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step1[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -1104,27 +1104,27 @@ fn ps_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     if split_step == 2 && cut >= 0 {
         mut all = match s.feed(step2[..cut]) {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "!${e}"
+                return "!${e.to_str()}"
             }
         }
         ro evs2 = match s.feed(step2[cut..]) {
             Ok(e2) => e2
             Err(e) => {
                 s.close()
-                return "${render(all)}!${e}"
+                return "${render(all)}!${e.to_str()}"
             }
         }
         all.append(evs2)
@@ -1134,7 +1134,7 @@ fn ps_run(split_step int, cut int) -> str {
             Ok(evs) => { out = "${out}${render(evs)}" }
             Err(e) => {
                 s.close()
-                return "${out}!${e}"
+                return "${out}!${e.to_str()}"
             }
         }
     }
@@ -1174,19 +1174,19 @@ fn chk_criterion_2_empty_query() -> () {
     ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
     assert(e1.len() == 2, "empty query: entry events")
     match s.query("   ") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     ro evs = match s.feed(cat(empty_query(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "empty query errored: ${e}")
+            assert(false, "empty query errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1211,20 +1211,20 @@ fn chk_criterion_2_error_in_extended_query_and_recovery() -> () {
     ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            println("DIAG EXTERR ${e}")
-            assert(false, "entry errored: ${e}")
+            println("DIAG EXTERR ${e.to_str()}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
     assert(e1.len() == 2, "ext error: entry events")
     match s.query_extended("SELECT bogus", [], [], []) {
         Ok(()) => ()
-        Err(e) => assert(false, "extended query errored: ${e}")
+        Err(e) => assert(false, "extended query errored: ${e.to_str()}")
     }
     ro evs = match s.feed(ext_error_server()) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "extended error round errored: ${e}")
+            assert(false, "extended error round errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1234,13 +1234,13 @@ fn chk_criterion_2_error_in_extended_query_and_recovery() -> () {
     // Recovery: a plain query works afterwards.
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "query after error errored: ${e}")
+        Err(e) => assert(false, "query after error errored: ${e.to_str()}")
     }
     ro ok_rows = cat3(row_desc("a"), data_row_text("7"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
     ro evs2 = match s.feed(ok_rows) {
         Ok(e) => e
         Err(e) => {
-            println("DIAG2 ${e}")
+            println("DIAG2 ${e.to_str()}")
             assert(false, "errored")
             []PgEvent.new()
         }
@@ -1265,7 +1265,7 @@ fn chk_criterion_2_extended_query_with_null_parameter_a() -> () {
     ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1276,12 +1276,12 @@ fn chk_criterion_2_extended_query_with_null_parameter_a() -> () {
     ps.push(ParamValue.null())
     match s.query_extended("SELECT 42, $1::int", [], ps, [1]) {
         Ok(()) => ()
-        Err(e) => assert(false, "extended query errored: ${e}")
+        Err(e) => assert(false, "extended query errored: ${e.to_str()}")
     }
     ro evs = match s.feed(extended_server()) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "extended round errored: ${e}")
+            assert(false, "extended round errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1308,7 +1308,7 @@ fn feed_extended(cut int) -> str {
     ro _e = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1316,7 +1316,7 @@ fn feed_extended(cut int) -> str {
     ps.push(ParamValue.null())
     match s.query_extended("SELECT 42, $1::int", [], ps, [1]) {
         Ok(()) => ()
-        Err(e) => assert(false, "extended query errored: ${e}")
+        Err(e) => assert(false, "extended query errored: ${e.to_str()}")
     }
     ro server = extended_server()
     ro evs = if cut < 0 {
@@ -1324,7 +1324,7 @@ fn feed_extended(cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "ERR:${e}"
+                return "ERR:${e.to_str()}"
             }
         }
     } else {
@@ -1332,7 +1332,7 @@ fn feed_extended(cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "ERR:${e}"
+                return "ERR:${e.to_str()}"
             }
         }
         match s.feed(server[cut..]) {
@@ -1342,7 +1342,7 @@ fn feed_extended(cut int) -> str {
             }
             Err(e) => {
                 s.close()
-                return "ERR:${e}"
+                return "ERR:${e.to_str()}"
             }
         }
     }
@@ -1366,20 +1366,20 @@ fn chk_criterion_2_notice_mid_query() -> () {
     ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
     assert(e1.len() == 2, "notice: entry events")
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     ro server = cat3(notice_response("index blah does not exist"), cat3(row_desc("a"), data_row_text("1"), cmd_complete("SELECT 1")), ready('I' as u8))
     ro evs = match s.feed(server) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "notice round errored: ${e}")
+            assert(false, "notice round errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1403,7 +1403,7 @@ fn chk_criterion_2_parameter_status_mid_session() -> () {
     ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1411,7 +1411,7 @@ fn chk_criterion_2_parameter_status_mid_session() -> () {
     ro evs = match s.feed(param_status("application_name", "myapp")) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "parameter status errored: ${e}")
+            assert(false, "parameter status errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1419,13 +1419,13 @@ fn chk_criterion_2_parameter_status_mid_session() -> () {
     assert(ev(evs[0]) == "ps:application_name=myapp", "ps mid ev0")
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     ro ok_rows = cat3(row_desc("a"), data_row_text("1"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
     ro evs2 = match s.feed(ok_rows) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "query round errored: ${e}")
+            assert(false, "query round errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1447,21 +1447,21 @@ fn chk_criterion_2_error_mid_simple_query_and_recovery() -> () {
     ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
     assert(e1.len() == 2, "recovery: entry events")
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     // The error lands after a RowDescription; the DataRow the server would
     // have sent is skipped together with everything up to ReadyForQuery.
     ro evs = match s.feed(recovery_server()) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "error round errored: ${e}")
+            assert(false, "error round errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1472,13 +1472,13 @@ fn chk_criterion_2_error_mid_simple_query_and_recovery() -> () {
     // The session is Ready again and runs the next query.
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "second query errored: ${e}")
+        Err(e) => assert(false, "second query errored: ${e.to_str()}")
     }
     ro ok_rows = cat3(row_desc("a"), data_row_text("9"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))
     ro evs2 = match s.feed(ok_rows) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "recovery round errored: ${e}")
+            assert(false, "recovery round errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1506,13 +1506,13 @@ fn feed_recovery(cut int) -> str {
     ro _e = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     ro server = recovery_server()
     ro evs = if cut < 0 {
@@ -1520,7 +1520,7 @@ fn feed_recovery(cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "ERR:${e}"
+                return "ERR:${e.to_str()}"
             }
         }
     } else {
@@ -1528,7 +1528,7 @@ fn feed_recovery(cut int) -> str {
             Ok(e) => e
             Err(e) => {
                 s.close()
-                return "ERR:${e}"
+                return "ERR:${e.to_str()}"
             }
         }
         match s.feed(server[cut..]) {
@@ -1538,7 +1538,7 @@ fn feed_recovery(cut int) -> str {
             }
             Err(e) => {
                 s.close()
-                return "ERR:${e}"
+                return "ERR:${e.to_str()}"
             }
         }
     }
@@ -1566,14 +1566,14 @@ fn chk_criterion_3_datarow_before_rowdescription_is_a_p() -> () {
     ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
     assert(e1.len() == 2, "entry events")
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     ro e = match s.feed(data_row_text("1")) {
         Ok(_) => {
@@ -1610,21 +1610,21 @@ fn chk_criterion_3_query_message_while_idle_is_a_protoc() -> () {
     ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
     assert(e1.len() == 2, "entry events")
     match s.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     // Finish the query properly, then send CommandComplete with no query in
     // flight.
     ro evs2 = match s.feed(cat3(row_desc("a"), data_row_text("1"), cat(cmd_complete("SELECT 1"), ready('I' as u8)))) {
         Ok(e) => e
         Err(e) => {
-            println("IDLE round err ${e}")
+            println("IDLE round err ${e.to_str()}")
             assert(false, "query round errored")
             []PgEvent.new()
         }
@@ -1666,19 +1666,19 @@ fn chk_criterion_4_begin_t_error_inside_e_rollback_i() -> () {
     ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
     assert(e1.len() == 2, "txn: entry events")
     match s.query("BEGIN") {
         Ok(()) => ()
-        Err(e) => assert(false, "BEGIN errored: ${e}")
+        Err(e) => assert(false, "BEGIN errored: ${e.to_str()}")
     }
     ro evs = match s.feed(cat(cmd_complete("BEGIN"), ready('T' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "BEGIN round errored: ${e}")
+            assert(false, "BEGIN round errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1686,12 +1686,12 @@ fn chk_criterion_4_begin_t_error_inside_e_rollback_i() -> () {
     assert(s.transaction_status() == 'T' as u8, "status after BEGIN")
     match s.query("SELECT bogus") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     ro evs2 = match s.feed(cat(error_response("42601", "syntax error"), ready('E' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "error round errored: ${e}")
+            assert(false, "error round errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1699,12 +1699,12 @@ fn chk_criterion_4_begin_t_error_inside_e_rollback_i() -> () {
     assert(s.transaction_status() == 'E' as u8, "status after error inside transaction")
     match s.query("ROLLBACK") {
         Ok(()) => ()
-        Err(e) => assert(false, "ROLLBACK errored: ${e}")
+        Err(e) => assert(false, "ROLLBACK errored: ${e.to_str()}")
     }
     ro evs3 = match s.feed(cat(cmd_complete("ROLLBACK"), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "ROLLBACK round errored: ${e}")
+            assert(false, "ROLLBACK round errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
@@ -1746,19 +1746,19 @@ fn chk_criterion_2_simple_query_two_statements() -> () {
     ro e1 = match s.feed(cat(auth_ok(), ready('I' as u8))) {
         Ok(e) => e
         Err(e) => {
-            assert(false, "entry errored: ${e}")
+            assert(false, "entry errored: ${e.to_str()}")
             []PgEvent.new()
         }
     }
     assert(e1.len() == 2, "two statements: entry events")
     match s.query("SELECT 1; SELECT 2") {
         Ok(()) => ()
-        Err(e) => assert(false, "query errored: ${e}")
+        Err(e) => assert(false, "query errored: ${e.to_str()}")
     }
     ro evs = match s.feed(two_stmt_server()) {
         Ok(e) => e
         Err(e) => {
-            println("TWOSTMT rows err: ${e}")
+            println("TWOSTMT rows err: ${e.to_str()}")
             assert(false, "rows errored")
             []PgEvent.new()
         }

@@ -50,7 +50,7 @@ import std.os.{real_os, args}
 import std.fs.{real_fs, read, write_text, Path}
 import std.encoding.base64.{Base64}
 import tls.{TlsStream, ClientConfig, VerificationMode, TlsError, TlsVersion, Tls12, Tls13}
-import postgres.{Session, SessionPhase, PgEvent, ParamValue, Row, QueryError, Ready, ClientMessage, SslAnswer, TlsSupported, TlsRefused, PostgresError, Protocol, Malformed}
+import postgres.{Session, SessionPhase, PgEvent, ParamValue, Row, QueryError, Ready, ClientMessage, SslAnswer, TlsSupported, TlsRefused, PostgresError, Protocol, MalformedPayload}
 import postgres.pgnet.{ConnError, connect, connect_options, open_tcp, connect_plain, text_at, Connection, Pool, Listener, ListenerMsg, ListenerEvent, Note, Event, Connected, Reconnected, Reconnecting}
 
 /// Whether and how to ask for TLS — slice Д8в criterion 2's TlsMode. It
@@ -94,7 +94,7 @@ fn run(host str, port int, mode str, argv []str) Fs Net Random Time -> Result[st
         return expect_tls_ca_error(host, port, VerificationMode.SystemRoots, name)
     }
     if mode == "multi" {
-        return multi_query_iteration(host, port).map_err(fn(e ConnError) -> str { "${e}" })
+        return multi_query_iteration(host, port).map_err(fn(e ConnError) -> str { e.to_str() })
     }
     if mode == "rowerr" {
         return row_stream_error_recovery(host, port)
@@ -125,7 +125,7 @@ fn read_ca(argv []str) Fs -> Result[[]u8, str] {
     ro path = argv.get(4) ?? "target/pg-ca.crt"
     match read(Path.posix(path)) {
         Ok(b) => Ok(b)
-        Err(e) => Err("read CA ${path}: ${e}")
+        Err(e) => Err("read CA ${path}: ${e.to_str()}")
     }
 }
 
@@ -145,19 +145,19 @@ fn pump_tls(mut stream TlsStream, mut session Session) Net -> Result[[]PgEvent, 
         if out.len() > 0 {
             match stream.write_all(out) {
                 Ok(()) => ()
-                Err(e) => return Err("write: ${e}")
+                Err(e) => return Err("write: ${e.to_str()}")
             }
         }
         ro chunk = match stream.read_bytes(65536) {
             Ok(b) => b
-            Err(e) => return Err("read: ${e}")
+            Err(e) => return Err("read: ${e.to_str()}")
         }
         if chunk.len() == 0 {
             return Err("read: server closed the connection")
         }
         ro evs = match session.feed(chunk) {
             Ok(e) => e
-            Err(e) => return Err("protocol: ${e}")
+            Err(e) => return Err("protocol: ${e.to_str()}")
         }
         mut i = 0
         while i < evs.len() {
@@ -189,7 +189,7 @@ fn tls_handshake(consume stream TcpStream, server_name str, verify VerificationM
     // lives inside the TlsStream. Nothing to share, nothing to close here.
     consume ts = match TlsStream.connect(stream, cfg) {
         Ok(consume t) => t
-        Err(e) => return Err("tls: ${e}")
+        Err(e) => return Err("tls: ${e.to_str()}")
     }
     tls_name = match ts.protocol_version() {
         Some(Tls12) => "TLS 1.2"
@@ -205,7 +205,7 @@ fn tls_handshake(consume stream TcpStream, server_name str, verify VerificationM
 fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mode TlsMode) Net Random -> Result[str, str] {
     consume stream = match open_tcp(host, port) {
         Ok(consume s) => s
-        Err(e) => return Err("tcp: ${e}")
+        Err(e) => return Err("tcp: ${e.to_str()}")
     }
     // SSLRequest inline: a mut-parameter roundtrip through a sub-function
     // corrupts the socket for the TLS handshake in this compiler
@@ -213,18 +213,18 @@ fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mo
     // and the handshake must stay in one function.
     match stream.write_all(ClientMessage.ssl_request()) {
         Ok(()) => ()
-        Err(e) => return Err("sslreq write: ${e}")
+        Err(e) => return Err("sslreq write: ${e.to_str()}")
     }
     ro answer = match stream.read_bytes(1) {
         Ok(b) => b
-        Err(e) => return Err("sslreq read: ${e}")
+        Err(e) => return Err("sslreq read: ${e.to_str()}")
     }
     if answer.len() == 0 {
         return Err("server closed the connection without answering SSLRequest")
     }
     ro answer = match SslAnswer.classify(answer[0]) {
         Ok(a) => a
-        Err(e) => return Err("ssl negotiation: ${e}")
+        Err(e) => return Err("ssl negotiation: ${e.to_str()}")
     }
     if answer != TlsSupported {
         // TlsMode.Require on 'N': the structured shape of the refusal.
@@ -289,7 +289,7 @@ fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mo
     // from D8b (checked live here for the first time).
     match session.query("BEGIN") {
         Ok(()) => ()
-        Err(e) => return Err("${e}")
+        Err(e) => return Err("${e.to_str()}")
     }
     ro _b = pump_tls(ts, session)?
     if session.transaction_status() != 'T' as u8 {
@@ -298,7 +298,7 @@ fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mo
     println("live: BEGIN -> transaction status 'T'")
     match session.query("SELECT bogus FROM") {
         Ok(()) => ()
-        Err(e) => return Err("${e}")
+        Err(e) => return Err("${e.to_str()}")
     }
     ro _e = pump_tls(ts, session)?
     if session.transaction_status() != 'E' as u8 {
@@ -307,7 +307,7 @@ fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mo
     println("live: error inside the transaction -> status 'E'")
     match session.query("ROLLBACK") {
         Ok(()) => ()
-        Err(e) => return Err("${e}")
+        Err(e) => return Err("${e.to_str()}")
     }
     ro _r = pump_tls(ts, session)?
     if session.transaction_status() != 'I' as u8 {
@@ -319,7 +319,7 @@ fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mo
     ro fin = session.close()
     match ts.write_all(fin) {
         Ok(()) => ()
-        Err(e) => return Err("close: ${e}")
+        Err(e) => return Err("close: ${e.to_str()}")
     }
     ts.close()
     Ok("${tls_name}: SCRAM, ssl=t, SELECT 1, 10000 rows, 42601 recovery, extended 42, NULL, BEGIN/T, error/E, ROLLBACK/I")
@@ -330,7 +330,7 @@ fn tls_full_run(host str, port int, verify VerificationMode, server_name str, mo
 fn expect_tls_name_error(host str, port int, verify VerificationMode, server_name str) Net Random -> Result[str, str] {
     consume stream = match open_tcp(host, port) {
         Ok(consume s) => s
-        Err(e) => return Err("tcp: ${e}")
+        Err(e) => return Err("tcp: ${e.to_str()}")
     }
     // SSLRequest inline: a mut-parameter roundtrip through a sub-function
     // corrupts the socket for the TLS handshake in this compiler
@@ -338,18 +338,18 @@ fn expect_tls_name_error(host str, port int, verify VerificationMode, server_nam
     // and the handshake must stay in one function.
     match stream.write_all(ClientMessage.ssl_request()) {
         Ok(()) => ()
-        Err(e) => return Err("sslreq write: ${e}")
+        Err(e) => return Err("sslreq write: ${e.to_str()}")
     }
     ro answer = match stream.read_bytes(1) {
         Ok(b) => b
-        Err(e) => return Err("sslreq read: ${e}")
+        Err(e) => return Err("sslreq read: ${e.to_str()}")
     }
     if answer.len() == 0 {
         return Err("server closed the connection without answering SSLRequest")
     }
     ro answer = match SslAnswer.classify(answer[0]) {
         Ok(a) => a
-        Err(e) => return Err("ssl negotiation: ${e}")
+        Err(e) => return Err("ssl negotiation: ${e.to_str()}")
     }
     if answer != TlsSupported {
         return Err("server unexpectedly refused TLS")
@@ -361,7 +361,7 @@ fn expect_tls_name_error(host str, port int, verify VerificationMode, server_nam
             Err("connect succeeded with a name the certificate does not carry")
         }
         Err(TlsError.HostnameMismatch(_)) => Ok("structured TLS error: HostnameMismatch (name not in the certificate)")
-        Err(e) => Err("wrong error kind: ${e}")
+        Err(e) => Err("wrong error kind: ${e.to_str()}")
     }
 }
 
@@ -369,7 +369,7 @@ fn expect_tls_name_error(host str, port int, verify VerificationMode, server_nam
 fn expect_tls_ca_error(host str, port int, verify VerificationMode, server_name str) Net Random -> Result[str, str] {
     consume stream = match open_tcp(host, port) {
         Ok(consume s) => s
-        Err(e) => return Err("tcp: ${e}")
+        Err(e) => return Err("tcp: ${e.to_str()}")
     }
     // SSLRequest inline: a mut-parameter roundtrip through a sub-function
     // corrupts the socket for the TLS handshake in this compiler
@@ -377,18 +377,18 @@ fn expect_tls_ca_error(host str, port int, verify VerificationMode, server_name 
     // and the handshake must stay in one function.
     match stream.write_all(ClientMessage.ssl_request()) {
         Ok(()) => ()
-        Err(e) => return Err("sslreq write: ${e}")
+        Err(e) => return Err("sslreq write: ${e.to_str()}")
     }
     ro answer = match stream.read_bytes(1) {
         Ok(b) => b
-        Err(e) => return Err("sslreq read: ${e}")
+        Err(e) => return Err("sslreq read: ${e.to_str()}")
     }
     if answer.len() == 0 {
         return Err("server closed the connection without answering SSLRequest")
     }
     ro answer = match SslAnswer.classify(answer[0]) {
         Ok(a) => a
-        Err(e) => return Err("ssl negotiation: ${e}")
+        Err(e) => return Err("ssl negotiation: ${e.to_str()}")
     }
     if answer != TlsSupported {
         return Err("server unexpectedly refused TLS")
@@ -400,7 +400,7 @@ fn expect_tls_ca_error(host str, port int, verify VerificationMode, server_name 
             Err("connect succeeded against an unknown CA")
         }
         Err(TlsError.CertificateInvalid(_)) => Ok("structured TLS error: CertificateInvalid (unknown CA)")
-        Err(e) => Err("wrong error kind: ${e}")
+        Err(e) => Err("wrong error kind: ${e.to_str()}")
     }
 }
 
@@ -422,7 +422,7 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
         None => ()
     }
     if count != 5 || sum != 15 {
-        return Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "query 1: ${count} rows, sum ${sum} (want 5 and 15)" } } })
+        return Err(ConnError.ProtocolViolation { error: PostgresError { kind: MalformedPayload { what: "query 1: ${count} rows, sum ${sum} (want 5 and 15)" } } })
     }
     println("live: query 1: ${count} rows iterated, sum ${sum}")
     // The same connection runs query 2 — nothing to give back.
@@ -437,7 +437,7 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
         frac = row.f64_at(2)?
         flag = row.bool_at(3)?
         if row.i16_at(4)? != 3 as i16 {
-            return Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "i16_at(4) != 3" } } })
+            return Err(ConnError.ProtocolViolation { error: PostgresError { kind: MalformedPayload { what: "i16_at(4) != 3" } } })
         }
     }
     match conn.error() {
@@ -445,10 +445,10 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
         None => ()
     }
     if answer != 42 {
-        return Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "query 2: ${answer} (want 42)" } } })
+        return Err(ConnError.ProtocolViolation { error: PostgresError { kind: MalformedPayload { what: "query 2: ${answer} (want 42)" } } })
     }
     if big != 7 as i64 || frac != 2.5 || !flag {
-        return Err(ConnError.Protocol { error: PostgresError { kind: Malformed { what: "typed accessors: ${big}, ${frac}, ${flag} (want 7, 2.5, true)" } } })
+        return Err(ConnError.ProtocolViolation { error: PostgresError { kind: MalformedPayload { what: "typed accessors: ${big}, ${frac}, ${flag} (want 7, 2.5, true)" } } })
     }
     println("live: query 2 on the same connection -> '${answer}', i64 ${big}, f64 ${frac}, bool ${flag}")
     conn.close()?
@@ -465,11 +465,11 @@ fn multi_query_iteration(host str, port int) Net Random -> Result[str, ConnError
 fn row_stream_error_recovery(host str, port int) Net Random -> Result[str, str] {
     consume conn = match connect(host, port, "postgres", "smoke", "postgres") {
         Ok(consume c) => c
-        Err(e) => return Err("connect: ${e}")
+        Err(e) => return Err("connect: ${e.to_str()}")
     }
     match conn.query("SELEC bogus") {
         Ok(()) => ()
-        Err(e) => return Err("query: ${e}")
+        Err(e) => return Err("query: ${e.to_str()}")
     }
     mut rows = 0
     for row in conn {
@@ -480,7 +480,7 @@ fn row_stream_error_recovery(host str, port int) Net Random -> Result[str, str] 
     }
     ro sqlstate = match conn.error() {
         Some(ConnError.Server { sqlstate, .. }) => sqlstate
-        Some(e) => return Err("wrong error variant: ${e}")
+        Some(e) => return Err("wrong error variant: ${e.to_str()}")
         None => return Err("a syntax error produced no error")
     }
     println("live: row iteration surfaced SQLSTATE ${sqlstate}")
@@ -488,19 +488,19 @@ fn row_stream_error_recovery(host str, port int) Net Random -> Result[str, str] 
     // ReadyForQuery. The next query runs on the same connection as-is.
     match conn.query("SELECT 1") {
         Ok(()) => ()
-        Err(e) => return Err("select 1: ${e}")
+        Err(e) => return Err("select 1: ${e.to_str()}")
     }
     ro one = match conn.next() {
         Some(row) => match row.text_at(0) {
             Ok(s) => s
-            Err(e) => return Err("${e}")
+            Err(e) => return Err("${e.to_str()}")
         }
         None => return Err("SELECT 1 produced no row")
     }
     println("live: same connection after the server error -> '${one}'")
     match conn.close() {
         Ok(()) => ()
-        Err(e) => return Err("close: ${e}")
+        Err(e) => return Err("close: ${e.to_str()}")
     }
     Ok("row iteration: server error 42601 surfaced structurally, connection recovered")
 }
@@ -512,7 +512,7 @@ fn row_stream_error_recovery(host str, port int) Net Random -> Result[str, str] 
 fn plain_text_value2(mut conn Connection, sql str) Net -> Result[str, str] {
     ro evs = match conn.simple_query(sql) {
         Ok(e) => e
-        Err(e) => return Err("${e}")
+        Err(e) => return Err("${e.to_str()}")
     }
     first_text_value(evs, "select 1")
 }
@@ -536,22 +536,22 @@ fn plain_text_value2(mut conn Connection, sql str) Net -> Result[str, str] {
 fn expect_refused(host str, port int) Net Random -> Result[str, str] {
     consume stream = match open_tcp(host, port) {
         Ok(consume s) => s
-        Err(e) => return Err("tcp: ${e}")
+        Err(e) => return Err("tcp: ${e.to_str()}")
     }
     match stream.write_all(ClientMessage.ssl_request()) {
         Ok(()) => ()
-        Err(e) => return Err("sslreq write: ${e}")
+        Err(e) => return Err("sslreq write: ${e.to_str()}")
     }
     ro answer = match stream.read_bytes(1) {
         Ok(b) => b
-        Err(e) => return Err("sslreq read: ${e}")
+        Err(e) => return Err("sslreq read: ${e.to_str()}")
     }
     if answer.len() == 0 {
         return Err("server closed the connection without answering SSLRequest")
     }
     ro answer = match SslAnswer.classify(answer[0]) {
         Ok(a) => a
-        Err(e) => return Err("ssl negotiation: ${e}")
+        Err(e) => return Err("ssl negotiation: ${e.to_str()}")
     }
     if answer != TlsRefused {
         return Err("plain server unexpectedly offered TLS")
@@ -572,29 +572,29 @@ fn expect_refused(host str, port int) Net Random -> Result[str, str] {
 fn plaintext_fallback(host str, port int, verify VerificationMode, what str) Net Random -> Result[str, str] {
     consume stream = match open_tcp(host, port) {
         Ok(consume s) => s
-        Err(e) => return Err("tcp: ${e}")
+        Err(e) => return Err("tcp: ${e.to_str()}")
     }
     match stream.write_all(ClientMessage.ssl_request()) {
         Ok(()) => ()
-        Err(e) => return Err("sslreq write: ${e}")
+        Err(e) => return Err("sslreq write: ${e.to_str()}")
     }
     ro answer = match stream.read_bytes(1) {
         Ok(b) => b
-        Err(e) => return Err("sslreq read: ${e}")
+        Err(e) => return Err("sslreq read: ${e.to_str()}")
     }
     if answer.len() == 0 {
         return Err("server closed the connection without answering SSLRequest")
     }
     ro answer = match SslAnswer.classify(answer[0]) {
         Ok(a) => a
-        Err(e) => return Err("ssl negotiation: ${e}")
+        Err(e) => return Err("ssl negotiation: ${e.to_str()}")
     }
     if answer != TlsRefused {
         return Err("plain server unexpectedly offered TLS")
     }
     consume conn = match connect_plain(stream, "postgres", "smoke", "postgres") {
         Ok(consume c) => c
-        Err(e) => return Err("connect: ${e}")
+        Err(e) => return Err("connect: ${e.to_str()}")
     }
     ro ssl = plain_ssl_value(conn)?
     println("live: ${what} -> plaintext (pg_stat_ssl -> f)")
@@ -605,10 +605,10 @@ fn plaintext_fallback(host str, port int, verify VerificationMode, what str) Net
 fn plaintext_disable(host str, port int) Net Random -> Result[str, str] {
     consume conn = match connect_plain(match open_tcp(host, port) {
         Ok(consume s) => s
-        Err(e) => return Err("tcp: ${e}")
+        Err(e) => return Err("tcp: ${e.to_str()}")
     }, "postgres", "smoke", "postgres") {
         Ok(consume c) => c
-        Err(e) => return Err("connect: ${e}")
+        Err(e) => return Err("connect: ${e.to_str()}")
     }
     ro ssl = plain_ssl_value(conn)?
     println("live: Disable -> plaintext, no SSLRequest (pg_stat_ssl -> f)")
@@ -632,13 +632,22 @@ fn listener_mode(host str, port int) Net Random Time Fs -> Result[str, str] {
     ro _m0 = write_text(Path.posix("target/listener-mark-0-start.txt"), "start")
     mut ln = Listener.new(host, port, "postgres", "smoke", "postgres", 100, 1000)
     ln.listen("demo")
-    ln.run_n(1, listener_cb)
+    ro s1 = ln.run_n(1, listener_cb)
+    if s1.notes != 1 || s1.connecteds != 1 || s1.reconnectings != 0 {
+        return Err("phase 1 counters: notes=${s1.notes} connecteds=${s1.connecteds} reconnectings=${s1.reconnectings} (want 1/1/0)")
+    }
     ro _m1 = write_text(Path.posix("target/listener-mark-1-phase1.txt"), "phase1")
     println("live: phase 1 done (first notification delivered)")
-    ln.run_n(1, listener_cb)
+    // bash kills the backend (pg_terminate_backend) while phase 2 blocks in
+    // next_event: the kill MUST surface as Reconnecting, then a reconnect
+    // with the channel re-LISTENed, then the second note.
+    ro s2 = ln.run_n(1, listener_cb)
+    if s2.notes != 1 || s2.reconnectings < 1 || s2.reconnecteds < 2 {
+        return Err("phase 2 counters: notes=${s2.notes} reconnectings=${s2.reconnectings} reconnecteds=${s2.reconnecteds} (want 1/>=1/>=2 — did the kill happen?)")
+    }
     ro _m2 = write_text(Path.posix("target/listener-mark-2-phase2.txt"), "phase2")
-    println("live: phase 2 done (delivered after the reconnect)")
-    Ok("Listener: connect+LISTEN, note delivered; container restart -> Reconnecting/backoff/Reconnected with the channel re-LISTENed; note delivered again")
+    println("live: phase 2 done (reconnect counted: ${s2.reconnectings} reconnecting(s), note re-delivered)")
+    Ok("Listener: connect+LISTEN with a note; backend kill -> counted Reconnecting/Reconnected with the channel re-LISTENed and the note delivered again")
 }
 
 // ─── small helpers over the query results ──────────────────────────────────
@@ -651,11 +660,11 @@ fn listener_mode(host str, port int) Net Random Time Fs -> Result[str, str] {
 fn notify_mode(host str, port int) Net Random -> Result[str, str] {
     consume conn1 = match connect(host, port, "postgres", "smoke", "postgres") {
         Ok(consume c) => c
-        Err(e) => return Err("conn1: ${e}")
+        Err(e) => return Err("conn1: ${e.to_str()}")
     }
     match conn1.simple_query("LISTEN demo") {
         Ok(_) => ()
-        Err(e) => return Err("LISTEN: ${e}")
+        Err(e) => return Err("LISTEN: ${e.to_str()}")
     }
     match conn1.try_next_event() {
         Some(n) => return Err("a notification before any NOTIFY: ${n.channel}")
@@ -663,15 +672,15 @@ fn notify_mode(host str, port int) Net Random -> Result[str, str] {
     }
     consume conn2 = match connect(host, port, "postgres", "smoke", "postgres") {
         Ok(consume c) => c
-        Err(e) => return Err("conn2: ${e}")
+        Err(e) => return Err("conn2: ${e.to_str()}")
     }
     match conn2.simple_query("SELECT pg_notify('demo', 'hello')") {
         Ok(_) => ()
-        Err(e) => return Err("pg_notify: ${e}")
+        Err(e) => return Err("pg_notify: ${e.to_str()}")
     }
     ro n = match conn1.next_event() {
         Ok(n) => n
-        Err(e) => return Err("next_event: ${e}")
+        Err(e) => return Err("next_event: ${e.to_str()}")
     }
     if n.channel != "demo" || n.payload != "hello" || n.pid <= 0 {
         return Err("bad notification: ${n.pid} ${n.channel} '${n.payload}'")
@@ -680,18 +689,18 @@ fn notify_mode(host str, port int) Net Random -> Result[str, str] {
     // Mid-query: the notification arrives while SELECT pg_sleep is running.
     match conn2.simple_query("SELECT pg_notify('demo', 'mid')") {
         Ok(_) => ()
-        Err(e) => return Err("pg_notify 2: ${e}")
+        Err(e) => return Err("pg_notify 2: ${e.to_str()}")
     }
     match conn1.query("SELECT pg_sleep(0.3)") {
         Ok(()) => ()
-        Err(e) => return Err("pg_sleep: ${e}")
+        Err(e) => return Err("pg_sleep: ${e.to_str()}")
     }
     mut rows = 0
     for _row in conn1 {
         rows += 1
     }
     match conn1.error() {
-        Some(e) => return Err("pg_sleep answer: ${e}")
+        Some(e) => return Err("pg_sleep answer: ${e.to_str()}")
         None => ()
     }
     match conn1.try_next_event() {
@@ -705,11 +714,11 @@ fn notify_mode(host str, port int) Net Random -> Result[str, str] {
     }
     match conn2.close() {
         Ok(()) => ()
-        Err(e) => return Err("conn2 close: ${e}")
+        Err(e) => return Err("conn2 close: ${e.to_str()}")
     }
     match conn1.close() {
         Ok(()) => ()
-        Err(e) => return Err("conn1 close: ${e}")
+        Err(e) => return Err("conn1 close: ${e.to_str()}")
     }
     Ok("LISTEN/NOTIFY: blocking next_event delivered {pid, channel, payload}; a mid-query notification was buffered and polled with try_next_event")
 }
@@ -721,19 +730,19 @@ fn pool_mode(host str, port int) Net Random Time -> Result[str, str] {
     consume pool = Pool.new(connect_options(host, port, "postgres", "smoke", "postgres"), 2)
     consume a = match pool.acquire() {
         Ok(consume c) => c
-        Err(e) => return Err("acquire a: ${e}")
+        Err(e) => return Err("acquire a: ${e.to_str()}")
     }
     ro pid_a = first_text_value(match a.simple_query("SELECT pg_backend_pid()") {
         Ok(evs) => evs
-        Err(e) => return Err("pid a: ${e}")
+        Err(e) => return Err("pid a: ${e.to_str()}")
     }, "pid a")?
     consume b = match pool.try_acquire() {
         Ok(consume c) => c
-        Err(e) => return Err("try_acquire b: ${e}")
+        Err(e) => return Err("try_acquire b: ${e.to_str()}")
     }
     ro pid_b = first_text_value(match b.simple_query("SELECT pg_backend_pid()") {
         Ok(evs) => evs
-        Err(e) => return Err("pid b: ${e}")
+        Err(e) => return Err("pid b: ${e.to_str()}")
     }, "pid b")?
     if pid_a == pid_b {
         return Err("two live connections share backend pid ${pid_a}")
@@ -745,23 +754,25 @@ fn pool_mode(host str, port int) Net Random Time -> Result[str, str] {
         }
         Err(e) => match e {
             ConnError.PoolExhausted => println("live: try_acquire at the limit -> PoolExhausted")
-            _ => return Err("try_acquire at the limit: ${e} (want PoolExhausted)")
+            _ => return Err("try_acquire at the limit: ${e.to_str()} (want PoolExhausted)")
         }
     }
     pool.release(a)
-    consume a2 = match pool.acquire() {
+    // Rebind of the same name (D347 R2, amend 2026-09-30): legal because
+    // release() already consumed the old `a`.
+    consume a = match pool.acquire() {
         Ok(consume c) => c
-        Err(e) => return Err("re-acquire a: ${e}")
+        Err(e) => return Err("re-acquire a: ${e.to_str()}")
     }
-    ro pid_a2 = first_text_value(match a2.simple_query("SELECT pg_backend_pid()") {
+    ro pid_a2 = first_text_value(match a.simple_query("SELECT pg_backend_pid()") {
         Ok(evs) => evs
-        Err(e) => return Err("pid a2: ${e}")
+        Err(e) => return Err("pid a2: ${e.to_str()}")
     }, "pid a2")?
     if pid_a2 != pid_a {
         return Err("warm reuse: pid ${pid_a2}, want the released ${pid_a}")
     }
     println("live: released connection re-acquired warm (pid ${pid_a2})")
-    pool.release(a2)
+    pool.release(a)
     pool.release(b)
     pool.close()
     Ok("pool: limit honoured, PoolExhausted at the limit, warm reuse by pg_backend_pid")
@@ -771,7 +782,7 @@ fn pool_mode(host str, port int) Net Random Time -> Result[str, str] {
 fn single_text_value(mut stream TlsStream, mut session Session, sql str, what str) Net -> Result[str, str] {
     match session.query(sql) {
         Ok(()) => ()
-        Err(e) => return Err("${e}")
+        Err(e) => return Err("${e.to_str()}")
     }
     ro evs = pump_tls(stream, session)?
     first_text_value(evs, what)
@@ -781,7 +792,7 @@ fn single_text_value(mut stream TlsStream, mut session Session, sql str, what st
 fn plain_ssl_value(consume conn Connection) Net -> Result[str, str] {
     match conn.query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()") {
         Ok(()) => ()
-        Err(e) => return Err("${e}")
+        Err(e) => return Err("${e.to_str()}")
     }
     mut val = ""
     mut got = false
@@ -792,7 +803,7 @@ fn plain_ssl_value(consume conn Connection) Net -> Result[str, str] {
                     val = t
                     got = true
                 }
-                Err(e) => return Err("${e}")
+                Err(e) => return Err("${e.to_str()}")
             }
         }
     }
@@ -800,12 +811,12 @@ fn plain_ssl_value(consume conn Connection) Net -> Result[str, str] {
         return Err("no row in the answer")
     }
     match conn.error() {
-        Some(e) => return Err("${e}")
+        Some(e) => return Err("${e.to_str()}")
         None => ()
     }
     match conn.close() {
         Ok(()) => ()
-        Err(e) => return Err("close: ${e}")
+        Err(e) => return Err("close: ${e.to_str()}")
     }
     if val != "f" {
         return Err("pg_stat_ssl.ssl expected 'f', got '${val}'")
@@ -843,7 +854,7 @@ fn first_text_value(evs []PgEvent, what str) -> Result[str, str] {
 fn count_rows(mut stream TlsStream, mut session Session, sql str) Net -> Result[int, str] {
     match session.query(sql) {
         Ok(()) => ()
-        Err(e) => return Err("${e}")
+        Err(e) => return Err("${e.to_str()}")
     }
     ro evs = pump_tls(stream, session)?
     mut rows = 0
@@ -873,7 +884,7 @@ fn find_sqlstate(evs []PgEvent) -> str {
 fn syntax_error_state(mut stream TlsStream, mut session Session) Net -> Result[str, str] {
     match session.query("SELEC bogus") {
         Ok(()) => ()
-        Err(e) => return Err("${e}")
+        Err(e) => return Err("${e.to_str()}")
     }
     ro evs = pump_tls(stream, session)?
     Ok(find_sqlstate(evs))
@@ -884,7 +895,7 @@ fn extended_text(mut stream TlsStream, mut session Session, sql str, param str) 
     ps.push(ParamValue.text(param))
     match session.query_extended(sql, [], ps, []) {
         Ok(()) => ()
-        Err(e) => return Err("${e}")
+        Err(e) => return Err("${e.to_str()}")
     }
     ro evs = pump_tls(stream, session)?
     first_text_value(evs, "extended")
@@ -895,7 +906,7 @@ fn extended_null(mut stream TlsStream, mut session Session) Net -> Result[bool, 
     ps.push(ParamValue.null())
     match session.query_extended("SELECT \$1::int", [], ps, []) {
         Ok(()) => ()
-        Err(e) => return Err("${e}")
+        Err(e) => return Err("${e.to_str()}")
     }
     ro evs = pump_tls(stream, session)?
     mut i = 0
