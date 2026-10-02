@@ -126,7 +126,7 @@ fn server_error(sqlstate str, message str) -> ConnError =>
 
 /// Constructor for [`ConnectOptions`].
 export fn connect_options(host str, port int, user str, password str, database str) -> ConnectOptions =>
-    { host, port, user, password, database }
+    { host, port, user, password, database, tls_server_name: "" }
 
 /// One-call plaintext connect: TCP, then the start-up phase. The
 /// convenience wrapper over open_tcp + connect_plain for the common
